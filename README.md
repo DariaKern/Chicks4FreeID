@@ -1,2 +1,2 @@
 # Chicks4Free
-a chicken re-identification dataset
+The chicken re-identification dataset
