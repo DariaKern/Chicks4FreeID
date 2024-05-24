@@ -1,4 +1,4 @@
-# Chicks4Free
+# Chicks4FreeID
 The very first open-source chicken re-identification dataset
 COMING SOON
 
