@@ -3,7 +3,7 @@ The Chicks4FreeID dataset and the accompanying code are released under the CC-BY
 This license allows for the distribution, remixing, adaptation, and building upon the dataset in any medium or format. 
 Users must give appropriate credit to the authors, include a link to the license, and clearly indicate if any changes were made. 
 Commercial use of the dataset is permitted. 
-For more information, please visit: \hyperlink{https://creativecommons.org/licenses/by/4.0/}{https://creativecommons.org/licenses/by/4.0/}.
+For more information, please visit: [https://creativecommons.org/licenses/by/4.0/](https://creativecommons.org/licenses/by/4.0/).
 
 ## Citation
 ```
