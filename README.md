@@ -2,7 +2,7 @@
 The very first publicly available chicken re-identification dataset
 COMING SOON
 
-<img src="./wiki/chickenDataset.png" width="1500" height="275">
+<img src="./wiki/chickenDataset.png">
 
 ## Papers and systems citing the Chicks4FreeID dataset
 comong soon ...
