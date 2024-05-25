@@ -23,3 +23,6 @@ COMING SOON
 <img src="./wiki/Coop (10).png" width="150" height="150"><img src="./wiki/38.png" width="150" height="150"><img src="./wiki/39.png" width="150" height="150"><img src="./wiki/40.png" width="150" height="150"><img src="./wiki/41.png" width="150" height="150"><img src="./wiki/42.png" width="150" height="150"><img src="./wiki/43.png" width="150" height="150"><img src="./wiki/44.png" width="150" height="150"><img src="./wiki/45.png" width="150" height="150"><img src="./wiki/46.png" width="150" height="150">
 
 <img src="./wiki/Coop (11).png" width="150" height="150"><img src="./wiki/47.png" width="150" height="150"><img src="./wiki/48.png" width="150" height="150"><img src="./wiki/49.png" width="150" height="150"><img src="./wiki/50.png" width="150" height="150">
+
+## Papers and systems citing the Chicks4FreeID dataset
+comong soon ...
