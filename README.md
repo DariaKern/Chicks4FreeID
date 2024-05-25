@@ -2,8 +2,7 @@
 The very first open-source chicken re-identification dataset
 COMING SOON
 
-<img src="./wiki/Coop (1).png" width="150" height="150"><img src="./wiki/1.png" width="150" height="150"><img src="./wiki/2.png" width="150" height="150"><img src="./wiki/3.png" width="150" height="150"><img src="./wiki/4.png" width="150" height="150">
-
+<img src="./wiki/Coop (1).png" width="150" height="150">
 
 ## Papers and systems citing the Chicks4FreeID dataset
 comong soon ...
