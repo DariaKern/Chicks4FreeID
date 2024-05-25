@@ -1,5 +1,5 @@
 # Chicks4FreeID
-The very first open-source chicken re-identification dataset
+The very first publicly available chicken re-identification dataset
 COMING SOON
 
 <img src="./wiki/chickenDataset.png" width="1500" height="275">
