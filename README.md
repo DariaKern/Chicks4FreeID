@@ -12,7 +12,7 @@ comong soon ...
 ```
 @misc{kern2024Chicks4FreeID,
       title={Chicks4freeID: A Benchmark Dataset for Chicken Re-Identification}, 
-      author={Daria Kern and Tobias Schiele and Ulrich Klauck and Winfred Ingabire},
+      author={Daria Kern and Tobias Schiele and Ulrich Klauck and Anjali DeSilva and Winfred Ingabire},
       year={2024},
       note={in preparation for NeurIPS 2024 Datasets and Benchmarks Track}
 }
