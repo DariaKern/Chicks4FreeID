@@ -121,7 +121,7 @@ parser.add_argument("--log-dir", type=Path, default="benchmark_logs")
 parser.add_argument("--batch-size-per-device", type=int, default=128)#default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=100)
 parser.add_argument("--num-workers", type=int, default=16)
-parser.add_argument("--accelerator", type=str, default="mps") # default="ddp" or "ddp2" or "gpu" or "cpu
+parser.add_argument("--accelerator", type=str, default="auto") # default="ddp" or "ddp2" or "gpu" or "cpu
 parser.add_argument("--devices", type=int, default=1)
 parser.add_argument("--precision", type=str, default="32") # "16-mixed")
 parser.add_argument("--ckpt-path", type=Path, default=None)
