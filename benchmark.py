@@ -34,7 +34,7 @@ from lightly_benchmarks.imagenet.resnet50 import simclr
 from lightly_benchmarks.imagenet.resnet50 import swav
 from lightly_benchmarks.imagenet.resnet50 import tico
 from lightly_benchmarks.imagenet.resnet50 import vicreg
-
+from lightly_benchmarks.imagenet.vitb16 import aim
 
 
 
@@ -99,26 +99,24 @@ class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
 
 
 METHODS = {
-    "barlowtwins": {
-        "model": barlowtwins.BarlowTwins,
-        "transform": barlowtwins.transform,
-    },
-    "byol": {"model": byol.BYOL, "transform": byol.transform},
-    "dcl": {"model": dcl.DCL, "transform": dcl.transform},
-    "dclw": {"model": dclw.DCLW, "transform": dclw.transform},
+    #"barlowtwins": {"model": barlowtwins.BarlowTwins, "transform": barlowtwins.transform,},
+    #"byol": {"model": byol.BYOL, "transform": byol.transform},
+    #"dcl": {"model": dcl.DCL, "transform": dcl.transform},
+    #"dclw": {"model": dclw.DCLW, "transform": dclw.transform},
+    "aim": {"model": aim.AIM, "transform": aim.transform},
     "dino": {"model": dino.DINO, "transform": dino.transform},
-    "mocov2": {"model": mocov2.MoCoV2, "transform": mocov2.transform},
-    "simclr": {"model": simclr.SimCLR, "transform": simclr.transform},
+    #"mocov2": {"model": mocov2.MoCoV2, "transform": mocov2.transform},
+    #"simclr": {"model": simclr.SimCLR, "transform": simclr.transform},
     "swav": {"model": swav.SwAV, "transform": swav.transform},
-    "tico": {"model": tico.TiCo, "transform": tico.transform},
-    "vicreg": {"model": vicreg.VICReg, "transform": vicreg.transform},
+    #"tico": {"model": tico.TiCo, "transform": tico.transform},
+    #"vicreg": {"model": vicreg.VICReg, "transform": vicreg.transform},
 }
 
 parser = ArgumentParser("Chicks4FreeID ResNet50 Benchmarks")
 #parser.add_argument("--train-dir", type=Path, default="/datasets/imagenet/train", )
 #parser.add_argument("--val-dir", type=Path, default="/datasets/imagenet/val")
 parser.add_argument("--log-dir", type=Path, default="benchmark_logs")
-parser.add_argument("--batch-size-per-device", type=int, default=128)#default=32) #default=128)
+parser.add_argument("--batch-size-per-device", type=int, default=32)#default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=100)
 parser.add_argument("--num-workers", type=int, default=16)
 parser.add_argument("--accelerator", type=str, default="auto") # default="ddp" or "ddp2" or "gpu" or "cpu
@@ -301,13 +299,13 @@ def pretrain(
         ],
         logger=TensorBoardLogger(save_dir=(log_dir), name="pretrain"),
         precision=precision,
-        gradient_clip_val=5.0,
         #strategy="ddp_find_unused_parameters_true",
         #sync_batchnorm=accelerator != "cpu",  # Sync batchnorm is not supported on CPU.
+        #gradient_clip_val=5.0,
         num_sanity_val_steps=0,
         log_every_n_steps=0,
-        check_val_every_n_epoch=5,
-        accumulate_grad_batches=4
+        #check_val_every_n_epoch=5,
+        #accumulate_grad_batches=4
     )
 
     trainer.fit(
