@@ -306,6 +306,8 @@ def pretrain(
         #sync_batchnorm=accelerator != "cpu",  # Sync batchnorm is not supported on CPU.
         num_sanity_val_steps=0,
         log_every_n_steps=0,
+        check_val_every_n_epoch=5,
+        accumulate_grad_batches=4
     )
 
     trainer.fit(

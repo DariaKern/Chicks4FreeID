@@ -81,8 +81,9 @@ def knn_eval(
             DeviceStatsMonitor(),
             metric_callback,
         ],
-        strategy="ddp_find_unused_parameters_true",
+        #strategy="ddp_find_unused_parameters_true",
         num_sanity_val_steps=0,
+        log_every_n_steps=0,
     )
     trainer.fit(
         model=classifier,

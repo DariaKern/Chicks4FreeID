@@ -116,8 +116,9 @@ def finetune_eval(
         ],
         logger=TensorBoardLogger(save_dir=str(log_dir), name="finetune_eval"),
         precision=precision,
-        strategy="ddp_find_unused_parameters_true",
+        #strategy="ddp_find_unused_parameters_true",
         num_sanity_val_steps=0,
+        log_every_n_steps=0,
     )
     classifier = FinetuneEvalClassifier(
         model=model,
