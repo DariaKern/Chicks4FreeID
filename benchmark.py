@@ -66,7 +66,7 @@ class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
 
         self.hf_dataset: Dataset = load_dataset(
             "dariakern/Chicks4FreeID", 
-            "chicken-re-id-all-visibility", 
+            "chicken-re-id-best-visibility", 
             trust_remote_code=True, 
             split="train" if train else "test",
         )
@@ -351,6 +351,4 @@ if __name__ == "__main__":
     LightlyDataset.__init__ = new_init
 
     #test benchmark
-
-
     main(**vars(args))
