@@ -70,16 +70,13 @@ class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
             trust_remote_code=True, 
             split="train" if train else "test",
         )
-        self.keys = self.hf_dataset.supervised_keys
         
     def __len__(self):
         return len(self.hf_dataset)
 
     def __getitem__(self, idx):
-        # Retrieve data at the specified index and return based on supervised_keys
-        data = self.hf_dataset[idx]
-        img = data[self.keys.input]     # Returns pil image
-        target = data[self.keys.output] # Returns an int
+        # Retrieve data at the specified index
+        img, target = self.hf_dataset[idx].values()
             
         if self.transform is not None:
             img = self.transform(img)
@@ -121,12 +118,12 @@ parser = ArgumentParser("Chicks4FreeID ResNet50 Benchmarks")
 #parser.add_argument("--train-dir", type=Path, default="/datasets/imagenet/train", )
 #parser.add_argument("--val-dir", type=Path, default="/datasets/imagenet/val")
 parser.add_argument("--log-dir", type=Path, default="benchmark_logs")
-parser.add_argument("--batch-size-per-device", type=int, default=1)#default=32) #default=128)
+parser.add_argument("--batch-size-per-device", type=int, default=128)#default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=100)
-parser.add_argument("--num-workers", type=int, default=4)
-parser.add_argument("--accelerator", type=str, default="gpu")
+parser.add_argument("--num-workers", type=int, default=16)
+parser.add_argument("--accelerator", type=str, default="mps") # default="ddp" or "ddp2" or "gpu" or "cpu
 parser.add_argument("--devices", type=int, default=1)
-parser.add_argument("--precision", type=str, default="16-mixed")
+parser.add_argument("--precision", type=str, default="32") # "16-mixed")
 parser.add_argument("--ckpt-path", type=Path, default=None)
 parser.add_argument("--compile-model", action="store_true")
 parser.add_argument("--methods", type=str, nargs="+")
@@ -293,20 +290,22 @@ def pretrain(
     metric_callback = MetricCallback()
     trainer = Trainer(
         max_epochs=epochs,
-        accelerator="auto",
+        accelerator=accelerator,
         #devices=devices,
         callbacks=[
             LearningRateMonitor(),
             # Stop if training loss diverges.
-            EarlyStopping(monitor="train_loss", patience=int(1e12), check_finite=True),
+            # EarlyStopping(monitor="train_loss", patience=int(1e12), check_finite=True),
             DeviceStatsMonitor(),
             metric_callback,
         ],
         logger=TensorBoardLogger(save_dir=(log_dir), name="pretrain"),
         precision=precision,
+        gradient_clip_val=5.0,
         #strategy="ddp_find_unused_parameters_true",
         #sync_batchnorm=accelerator != "cpu",  # Sync batchnorm is not supported on CPU.
         num_sanity_val_steps=0,
+        log_every_n_steps=0,
     )
 
     trainer.fit(
@@ -342,13 +341,8 @@ def new_init(self, input_dir, transform):
 
 
 if __name__ == "__main__":
-
-    import lightly.data as data
-
     args = parser.parse_args()
     args.train_dir = "train"
     args.val_dir = "test"
     LightlyDataset.__init__ = new_init
-
-    #test benchmark
     main(**vars(args))
