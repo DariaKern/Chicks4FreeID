@@ -38,10 +38,6 @@ from lightly_benchmarks.imagenet.vitb16 import aim
 from lightly_benchmarks.imagenet.resnet50 import mega_descriptor_L384
 from lightly_benchmarks.imagenet.resnet50 import resnet50
 
-
-#### HF TO LIGHTLY DATASET
-
-
 from pathlib import Path
 from typing import Callable, Optional, Union
 from datasets import Dataset
@@ -49,60 +45,14 @@ from datasets import load_dataset
 
 import torchvision
 
-class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
-    """
-    Provides the HuggingFace dataset as a Torchvision dataset.
-    The dataset will return a tuple of the input and output based on the supervised_keys.
-    """
-    
-    def __init__(
-        self,
-        root: Union[str, Path] = None,
-        train: bool = True,
-        transform: Optional[Callable] = None,
-        target_transform: Optional[Callable] = None,
-        download: bool = True,
-    ) -> None:
-        super().__init__(root, transform=transform, target_transform=target_transform)
-
-        self.hf_dataset: Dataset = load_dataset(
-            "dariakern/Chicks4FreeID", 
-            "chicken-re-id-best-visibility", 
-            trust_remote_code=True, 
-            split="train" if train else "test",
-            keep_in_memory=True
-        )
         
-    def __len__(self):
-        return len(self.hf_dataset)
-
-    def __getitem__(self, idx):
-        # Retrieve data at the specified index
-        img, target = self.hf_dataset[idx].values()
-            
-        if self.transform is not None:
-            img = self.transform(img)
-
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-
-        return img, target
-    
-    def __str__(self):
-        return self
-        
-
-
-
-#####################
-
 
 
 
 
 METHODS = {
-    #"swav": {"model": swav.SwAV, "transform": swav.transform},
-    "resnet50": {"model": torchvision.models.resnet50, "transform": resnet50.transform}, 
+    "swav": {"model": swav.SwAV, "transform": swav.transform},
+    "resnet50": {"model": resnet50.ResNet50Classifier, "transform": resnet50.transform}, 
     "mega_descriptor_l384": {"model": mega_descriptor_L384.MegaDescriptorL384, "transform": mega_descriptor_L384.transform},
     #"barlowtwins": {"model": barlowtwins.BarlowTwins, "transform": barlowtwins.transform,},
     #"byol": {"model": byol.BYOL, "transform": byol.transform},
@@ -117,8 +67,6 @@ METHODS = {
 }
 
 parser = ArgumentParser("Chicks4FreeID ResNet50 Benchmarks")
-#parser.add_argument("--train-dir", type=Path, default="/datasets/imagenet/train", )
-#parser.add_argument("--val-dir", type=Path, default="/datasets/imagenet/val")
 parser.add_argument("--log-dir", type=Path, default="benchmark_logs")
 parser.add_argument("--batch-size-per-device", type=int, default=128)#default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=1)
@@ -159,6 +107,8 @@ def main(
     method_names = methods or METHODS.keys()
 
     for method in method_names:
+        print_rank_zero(f"Running benchmark for method {method}...")
+        
         method_dir = (
             log_dir / method / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         ).resolve()
@@ -224,8 +174,8 @@ def main(
 
         
 
-        if model.projection_head is  None:
-            print_rank_zero("Model does not have a projection head, skipping pretraining.")
+        if hasattr(model, "is_unsupervised") and model.is_unsupervised:
+            print_rank_zero("Unsupervise setting uses a pretrained model - skipping pretraining")
         elif epochs <= 0:
             print_rank_zero("Epochs <= 0, skipping pretraining.")
             if ckpt_path is not None:
@@ -240,6 +190,16 @@ def main(
                 **common_args
             )
 
+        if skip_knn_eval:
+            print_rank_zero("Skipping KNN eval.")
+        else:
+            knn_eval.knn_eval(
+                transform=val_transform,
+                num_classes=num_classes,
+                **common_args
+            )
+ 
+
         if skip_linear_eval:
             print_rank_zero("Skipping linear eval.")
         else:
@@ -251,19 +211,14 @@ def main(
                 **common_args
             )
 
-        if skip_knn_eval:
-            print_rank_zero("Skipping KNN eval.")
-        else:
-            knn_eval.knn_eval(
-                transform=val_transform,
-                num_classes=num_classes,
-                **common_args
-            )
- 
+
 
         if skip_finetune_eval:
             print_rank_zero("Skipping fine-tune eval.")
         else:
+            raise NotImplementedError(
+                "Fine-tune evaluation is currently not implemented for all methods"
+            )
             finetune_eval.finetune_eval(
                 train_transform=eval_transform,
                 val_transform=val_transform,
@@ -348,7 +303,55 @@ def pretrain(
         print_rank_zero(f"max {metric}: {max(metric_callback.val_metrics[metric])}")
 
 
+
+
+
 # Monkeypatch LightlyDataset such that __init__ initializes a Chick4FreeReIDBestTorchVisionDataset
+
+
+class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
+    """
+    Provides the HuggingFace dataset as a Torchvision dataset.
+    The dataset will return a tuple of the input and output based on the supervised_keys.
+    """
+    
+    def __init__(
+        self,
+        root: Union[str, Path] = None,
+        train: bool = True,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        download: bool = True,
+    ) -> None:
+        super().__init__(root, transform=transform, target_transform=target_transform)
+
+        self.hf_dataset: Dataset = load_dataset(
+            "dariakern/Chicks4FreeID", 
+            "chicken-re-id-best-visibility", 
+            trust_remote_code=True, 
+            split="train" if train else "test",
+            keep_in_memory=True
+        )
+        
+    def __len__(self):
+        return len(self.hf_dataset)
+
+    def __getitem__(self, idx):
+        # Retrieve data at the specified index
+        img, target = self.hf_dataset[idx].values()
+            
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+    
+    def __str__(self):
+        return self
+    
+
 old_init = LightlyDataset.__init__
 def new_init(self, input_dir, transform):
     try:
