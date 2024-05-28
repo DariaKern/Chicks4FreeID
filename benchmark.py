@@ -69,6 +69,7 @@ class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
             "chicken-re-id-best-visibility", 
             trust_remote_code=True, 
             split="train" if train else "test",
+            keep_in_memory=True
         )
         
     def __len__(self):
@@ -103,11 +104,11 @@ METHODS = {
     #"byol": {"model": byol.BYOL, "transform": byol.transform},
     #"dcl": {"model": dcl.DCL, "transform": dcl.transform},
     #"dclw": {"model": dclw.DCLW, "transform": dclw.transform},
+    "swav": {"model": swav.SwAV, "transform": swav.transform},
     "aim": {"model": aim.AIM, "transform": aim.transform},
     "dino": {"model": dino.DINO, "transform": dino.transform},
     #"mocov2": {"model": mocov2.MoCoV2, "transform": mocov2.transform},
     #"simclr": {"model": simclr.SimCLR, "transform": simclr.transform},
-    "swav": {"model": swav.SwAV, "transform": swav.transform},
     #"tico": {"model": tico.TiCo, "transform": tico.transform},
     #"vicreg": {"model": vicreg.VICReg, "transform": vicreg.transform},
 }
@@ -116,12 +117,12 @@ parser = ArgumentParser("Chicks4FreeID ResNet50 Benchmarks")
 #parser.add_argument("--train-dir", type=Path, default="/datasets/imagenet/train", )
 #parser.add_argument("--val-dir", type=Path, default="/datasets/imagenet/val")
 parser.add_argument("--log-dir", type=Path, default="benchmark_logs")
-parser.add_argument("--batch-size-per-device", type=int, default=32)#default=32) #default=128)
+parser.add_argument("--batch-size-per-device", type=int, default=128)#default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=100)
-parser.add_argument("--num-workers", type=int, default=16)
+parser.add_argument("--num-workers", type=int, default=4)
 parser.add_argument("--accelerator", type=str, default="auto") # default="ddp" or "ddp2" or "gpu" or "cpu
 parser.add_argument("--devices", type=int, default=1)
-parser.add_argument("--precision", type=str, default="32") # "16-mixed")
+parser.add_argument("--precision", type=str, default="16-mixed") # "16-mixed")
 parser.add_argument("--ckpt-path", type=Path, default=None)
 parser.add_argument("--compile-model", action="store_true")
 parser.add_argument("--methods", type=str, nargs="+")
@@ -252,7 +253,11 @@ def pretrain(
     print_rank_zero(f"Running pretraining for {method}...")
 
     # Setup training data.
-    train_transform = METHODS[method]["transform"]
+    train_transform = T.Compose([
+        T.Resize(224),
+        T.RandomRotation(360),
+        METHODS[method]["transform"]
+    ])
 
     train_dataset = LightlyDataset(input_dir=(train_dir), transform=train_transform)
     
@@ -268,8 +273,8 @@ def pretrain(
     # Setup validation data.
     val_transform = T.Compose(
         [
-            T.Resize(256),
-            T.CenterCrop(224),
+            T.Resize(224),
+            #T.CenterCrop(224),
             T.ToTensor(),
             T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"]),
         ]
@@ -324,15 +329,8 @@ def new_init(self, input_dir, transform):
     try:
         LightlyDataset.__init__ = old_init
 
-        torch_ds = Chicks4FreeReIDBestTorchVisionDataset(train=input_dir=="train", download=True)
-
-        #from torchvision.datasets import CIFAR10
-        #torch_ds = CIFAR10(root=".", train=input_dir=="train", download=True)
-        # for i in range(10):
-        #    print(torch_ds[i])
-        
+        torch_ds = Chicks4FreeReIDBestTorchVisionDataset(train=input_dir=="train", download=True)        
         ds = LightlyDataset.from_torch_dataset(torch_ds, transform)
-        # print(ds[0])
 
         self.__dict__.update(ds.__dict__)
     finally:
