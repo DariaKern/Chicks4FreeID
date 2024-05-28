@@ -5,7 +5,7 @@ COMING SOON
 <img src="./wiki/chickenDataset.png">
 
 ## Papers and systems citing the Chicks4FreeID dataset
-comong soon ...
+coming soon ...
 
 
 ## Citation
