@@ -35,7 +35,8 @@ from lightly_benchmarks.imagenet.resnet50 import swav
 from lightly_benchmarks.imagenet.resnet50 import tico
 from lightly_benchmarks.imagenet.resnet50 import vicreg
 from lightly_benchmarks.imagenet.vitb16 import aim
-
+from lightly_benchmarks.imagenet.resnet50 import mega_descriptor_L384
+from lightly_benchmarks.imagenet.resnet50 import resnet50
 
 
 #### HF TO LIGHTLY DATASET
@@ -100,13 +101,15 @@ class Chicks4FreeReIDBestTorchVisionDataset(torchvision.datasets.VisionDataset):
 
 
 METHODS = {
+    #"swav": {"model": swav.SwAV, "transform": swav.transform},
+    "resnet50": {"model": torchvision.models.resnet50, "transform": resnet50.transform}, 
+    "mega_descriptor_l384": {"model": mega_descriptor_L384.MegaDescriptorL384, "transform": mega_descriptor_L384.transform},
     #"barlowtwins": {"model": barlowtwins.BarlowTwins, "transform": barlowtwins.transform,},
     #"byol": {"model": byol.BYOL, "transform": byol.transform},
     #"dcl": {"model": dcl.DCL, "transform": dcl.transform},
     #"dclw": {"model": dclw.DCLW, "transform": dclw.transform},
-    "swav": {"model": swav.SwAV, "transform": swav.transform},
-    "aim": {"model": aim.AIM, "transform": aim.transform},
-    "dino": {"model": dino.DINO, "transform": dino.transform},
+    #"aim": {"model": aim.AIM, "transform": aim.transform},
+    #"dino": {"model": dino.DINO, "transform": dino.transform},
     #"mocov2": {"model": mocov2.MoCoV2, "transform": mocov2.transform},
     #"simclr": {"model": simclr.SimCLR, "transform": simclr.transform},
     #"tico": {"model": tico.TiCo, "transform": tico.transform},
@@ -118,7 +121,7 @@ parser = ArgumentParser("Chicks4FreeID ResNet50 Benchmarks")
 #parser.add_argument("--val-dir", type=Path, default="/datasets/imagenet/val")
 parser.add_argument("--log-dir", type=Path, default="benchmark_logs")
 parser.add_argument("--batch-size-per-device", type=int, default=128)#default=32) #default=128)
-parser.add_argument("--epochs", type=int, default=100)
+parser.add_argument("--epochs", type=int, default=1)
 parser.add_argument("--num-workers", type=int, default=4)
 parser.add_argument("--accelerator", type=str, default="auto") # default="ddp" or "ddp2" or "gpu" or "cpu
 parser.add_argument("--devices", type=int, default=1)
@@ -129,7 +132,7 @@ parser.add_argument("--methods", type=str, nargs="+")
 parser.add_argument("--num-classes", type=int, default=50)
 parser.add_argument("--skip-knn-eval", action="store_true")
 parser.add_argument("--skip-linear-eval", action="store_true")
-parser.add_argument("--skip-finetune-eval", action="store_true")
+parser.add_argument("--skip-finetune-eval", action="store_true", default=True)
 
 
 
@@ -167,72 +170,106 @@ def main(
             # Compile model if PyTorch supports it.
             print_rank_zero("Compiling model...")
             model = torch.compile(model)
+        
+        input_size = 384 
+        if hasattr(model, "input_size"):
+            input_size = model.input_size
 
-        if epochs <= 0:
+        feature_dim = 2048
+        if hasattr(model, "feature_dim"):
+            feature_dim = model.feature_dim
+        
+        normalize = T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"])
+        if hasattr(model, "normalize"):
+            normalize = model.normalize
+
+        # Transform for pretaining of the embedding
+        pretrain_transform = T.Compose([
+            T.Resize(input_size),
+            T.RandomRotation(360),
+            METHODS[method]["transform"]
+        ])
+
+        # Transform for linear eval training and fine-tuning
+        eval_transform = T.Compose(
+            [
+                T.RandomResizedCrop(input_size),
+                T.RandomHorizontalFlip(),
+                T.ToTensor(),
+                normalize,
+            ]
+        )
+
+        # Transform for validation and knn evaluation
+        val_transform = T.Compose(
+            [
+                T.Resize(input_size),
+                T.ToTensor(),
+                normalize
+            ]
+        )
+
+
+        common_args = {
+            "model": model,
+            "train_dir": train_dir,
+            "val_dir": val_dir,
+            "log_dir": method_dir,
+            "batch_size_per_device": batch_size_per_device,
+            "num_workers": num_workers,
+            "accelerator": accelerator,
+            "devices": devices,
+            "precision": precision,
+        }
+
+        
+
+        if model.projection_head is  None:
+            print_rank_zero("Model does not have a projection head, skipping pretraining.")
+        elif epochs <= 0:
             print_rank_zero("Epochs <= 0, skipping pretraining.")
             if ckpt_path is not None:
                 model.load_state_dict(torch.load(ckpt_path)["state_dict"])
         else:
             pretrain(
-                model=model,
                 method=method,
-                train_dir=train_dir,
-                val_dir=val_dir,
-                log_dir=method_dir,
-                batch_size_per_device=batch_size_per_device,
                 epochs=epochs,
-                num_workers=num_workers,
-                accelerator=accelerator,
-                devices=devices,
-                precision=precision,
                 ckpt_path=ckpt_path,
-            )
-
-        if skip_knn_eval:
-            print_rank_zero("Skipping KNN eval.")
-        else:
-            knn_eval.knn_eval(
-                model=model,
-                num_classes=num_classes,
-                train_dir=train_dir,
-                val_dir=val_dir,
-                log_dir=method_dir,
-                batch_size_per_device=batch_size_per_device,
-                num_workers=num_workers,
-                accelerator=accelerator,
-                devices=devices,
+                train_transform=pretrain_transform,
+                val_transform=val_transform,
+                **common_args
             )
 
         if skip_linear_eval:
             print_rank_zero("Skipping linear eval.")
         else:
             linear_eval.linear_eval(
-                model=model,
                 num_classes=num_classes,
-                train_dir=train_dir,
-                val_dir=val_dir,
-                log_dir=method_dir,
-                batch_size_per_device=batch_size_per_device,
-                num_workers=num_workers,
-                accelerator=accelerator,
-                devices=devices,
-                precision=precision,
+                train_transform=eval_transform,
+                val_transform=val_transform,
+                feature_dim=feature_dim,
+                **common_args
             )
+
+        if skip_knn_eval:
+            print_rank_zero("Skipping KNN eval.")
+        else:
+            knn_eval.knn_eval(
+                transform=val_transform,
+                num_classes=num_classes,
+                **common_args
+            )
+ 
 
         if skip_finetune_eval:
             print_rank_zero("Skipping fine-tune eval.")
         else:
             finetune_eval.finetune_eval(
-                model=model,
+                train_transform=eval_transform,
+                val_transform=val_transform,
                 num_classes=num_classes,
-                train_dir=train_dir,
-                val_dir=val_dir,
-                log_dir=method_dir,
-                batch_size_per_device=batch_size_per_device,
-                num_workers=num_workers,
-                accelerator=accelerator,
-                devices=devices,
-                precision=precision,
+                feature_dim=feature_dim,
+                **common_args
             )
 
 
@@ -249,15 +286,12 @@ def pretrain(
     devices: int,
     precision: str,
     ckpt_path: Union[Path, None],
+    train_transform: Callable,
+    val_transform: Callable,
+
 ) -> None:
     print_rank_zero(f"Running pretraining for {method}...")
 
-    # Setup training data.
-    train_transform = T.Compose([
-        T.Resize(224),
-        T.RandomRotation(360),
-        METHODS[method]["transform"]
-    ])
 
     train_dataset = LightlyDataset(input_dir=(train_dir), transform=train_transform)
     
@@ -270,15 +304,6 @@ def pretrain(
         persistent_workers=False,
     )
 
-    # Setup validation data.
-    val_transform = T.Compose(
-        [
-            T.Resize(224),
-            #T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"]),
-        ]
-    )
     val_dataset = LightlyDataset(input_dir=(val_dir), transform=val_transform)
     
     val_dataloader = DataLoader(

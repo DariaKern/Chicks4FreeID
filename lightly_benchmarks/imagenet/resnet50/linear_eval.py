@@ -24,6 +24,10 @@ def linear_eval(
     devices: int,
     precision: str,
     num_classes: int,
+    train_transform: T.Compose,
+    val_transform: T.Compose,
+    epochs: int = 90,
+    feature_dim: int = 2048,
 ) -> None:
     """Runs a linear evaluation on the given model.
 
@@ -44,14 +48,6 @@ def linear_eval(
     print_rank_zero("Running linear evaluation...")
 
     # Setup training data.
-    train_transform = T.Compose(
-        [
-            T.RandomResizedCrop(224),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"]),
-        ]
-    )
     train_dataset = LightlyDataset(input_dir=str(train_dir), transform=train_transform)
     train_dataloader = DataLoader(
         train_dataset,
@@ -63,14 +59,6 @@ def linear_eval(
     )
 
     # Setup validation data.
-    val_transform = T.Compose(
-        [
-            T.Resize(256),
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"]),
-        ]
-    )
     val_dataset = LightlyDataset(input_dir=str(val_dir), transform=val_transform)
     val_dataloader = DataLoader(
         val_dataset,
@@ -83,7 +71,7 @@ def linear_eval(
     # Train linear classifier.
     metric_callback = MetricCallback()
     trainer = Trainer(
-        max_epochs=90,
+        max_epochs=epochs,
         accelerator=accelerator,
         devices=devices,
         callbacks=[
@@ -100,7 +88,7 @@ def linear_eval(
     classifier = LinearClassifier(
         model=model,
         batch_size_per_device=batch_size_per_device,
-        feature_dim=2048,
+        feature_dim=feature_dim,
         num_classes=num_classes,
         freeze_model=True,
     )

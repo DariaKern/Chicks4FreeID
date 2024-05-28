@@ -47,13 +47,17 @@ def finetune_eval(
     devices: int,
     precision: str,
     num_classes: int,
+    train_transform: T.Compose,
+    val_transform: T.Compose,
+    epochs: int = 30,
+    feature_dim: int = 2048,
 ) -> None:
     """Runs fine-tune evaluation on the given model.
 
     Parameters follow SimCLR [0] settings.
 
     The most important settings are:
-        - Backbone: Frozen
+        - Backbone: Un-Frozen
         - Epochs: 30
         - Optimizer: SGD
         - Base Learning Rate: 0.05
@@ -66,15 +70,7 @@ def finetune_eval(
     """
     print_rank_zero("Running fine-tune evaluation...")
 
-    # Setup training data.
-    train_transform = T.Compose(
-        [
-            T.RandomResizedCrop(224),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"]),
-        ]
-    )
+
     train_dataset = LightlyDataset(input_dir=str(train_dir), transform=train_transform)
     train_dataloader = DataLoader(
         train_dataset,
@@ -85,15 +81,6 @@ def finetune_eval(
         persistent_workers=False,
     )
 
-    # Setup validation data.
-    val_transform = T.Compose(
-        [
-            T.Resize(256),
-            T.CenterCrop(224),
-            T.ToTensor(),
-            T.Normalize(mean=IMAGENET_NORMALIZE["mean"], std=IMAGENET_NORMALIZE["std"]),
-        ]
-    )
     val_dataset = LightlyDataset(input_dir=str(val_dir), transform=val_transform)
     val_dataloader = DataLoader(
         val_dataset,
@@ -106,7 +93,7 @@ def finetune_eval(
     # Train linear classifier.
     metric_callback = MetricCallback()
     trainer = Trainer(
-        max_epochs=30,
+        max_epochs=epochs,
         accelerator=accelerator,
         devices=devices,
         callbacks=[
@@ -123,7 +110,7 @@ def finetune_eval(
     classifier = FinetuneEvalClassifier(
         model=model,
         batch_size_per_device=batch_size_per_device,
-        feature_dim=2048,
+        feature_dim=feature_dim,
         num_classes=num_classes,
         freeze_model=False,
     )

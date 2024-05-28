@@ -171,7 +171,12 @@ class SwAV(LightningModule):
         return [optimizer], [scheduler]
 
 
-transform = SwaVTransform(crop_counts=CROP_COUNTS)
+transform = SwaVTransform(
+    rr_prob=0.5,
+    rr_degrees=360,
+    gaussian_blur=0.1,
+    crop_counts=CROP_COUNTS
+)
 
 
 @torch.no_grad()

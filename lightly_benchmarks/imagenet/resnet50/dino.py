@@ -163,4 +163,10 @@ class DINO(LightningModule):
 
 # For ResNet50 we adjust crop scales as recommended by the authors:
 # https://github.com/facebookresearch/dino#resnet-50-and-other-convnets-trainings
-transform = DINOTransform(global_crop_scale=(0.14, 1), local_crop_scale=(0.05, 0.14))
+transform = DINOTransform(
+    global_crop_scale=(0.14, 1), 
+    local_crop_scale=(0.05, 0.14),
+    rr_prob=0.5,
+    rr_degrees=360,
+    gaussian_blur=(0.1, 0.1, 0.1),
+)
