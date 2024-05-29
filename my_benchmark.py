@@ -1,7 +1,8 @@
 import argparse
 from dataclasses import Field, dataclass, field
-from datetime import datetime
-import math
+import time
+from datetime import datetime, timedelta
+from tqdm import tqdm
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
@@ -48,8 +49,6 @@ from lightly.utils.scheduler import CosineWarmupScheduler
 import timm
 
 
-
-
 @dataclass
 class Config:
     batch_size_per_device: int = 128
@@ -68,6 +67,17 @@ class Config:
     test_run: bool = True
     check_val_every_n_epoch: int = 5
 
+
+def timing_decorator(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        duration_seconds = end_time - start_time
+        duration_timedelta = timedelta(seconds=duration_seconds)
+        print(f"Duration: {duration_timedelta}")
+        return result
+    return wrapper
 
 
 def knn_predict(
@@ -147,7 +157,6 @@ def knn_predict(
     )
     pred_labels = pred_scores.argsort(dim=-1, descending=True)
     return pred_labels, pred_scores
-
 
 
 class KNNClassifier(LightningModule):
@@ -313,9 +322,6 @@ class KNNClassifier(LightningModule):
         pass
 
 
-
-
-
 class LinearClassifier(LightningModule):
     """
     A lightly Linear Classifier, modified to log the mean average precision
@@ -473,8 +479,6 @@ class LinearClassifier(LightningModule):
             self.model.eval()
 
 
-
-
 class OnlineLinearClassifier(LightningModule):
     """
     A lightly Online Linear Classifier, modified to log the mean average precision
@@ -523,7 +527,6 @@ class OnlineLinearClassifier(LightningModule):
         log_dict.update({f"val_online_cls_top{k}": acc for k, acc in topk.items()})
         log_dict["val_online_cls_mAP"] = mAP
         return loss, log_dict
-
 
 
 class SwAV(LightningModule):
@@ -742,8 +745,6 @@ class ResNet50Classifier(LinearClassifier):
         self.classification_head = fc
 
 
-
-
 class ResNetEmbedding(LightningModule):
     """
     Converts a ResNet50Classifier into a feature extractor.
@@ -751,19 +752,13 @@ class ResNetEmbedding(LightningModule):
     def __init__(
         self,
         model: ResNet50Classifier,
-        freeze_model: bool = False,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore="model")
-
         self.model = model.model
-        self.freeze_model = freeze_model
 
     def forward(self, images: Tensor) -> Tensor:
-        if self.freeze_model:
-            with torch.no_grad():
-                features = self.model.forward(images).flatten(start_dim=1)
-        else:
+        with torch.no_grad():
             features = self.model.forward(images).flatten(start_dim=1)
         return features
 
@@ -792,7 +787,9 @@ class MegaDescriptorL384(LightningModule):
         self.backbone = model
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.backbone(x)
+        with torch.no_grad():
+            return self.backbone(x)
+        
 
     def configure_optimizers(self):
         # configure_optimizers must be implemented for PyTorch Lightning. Returning None
@@ -800,12 +797,15 @@ class MegaDescriptorL384(LightningModule):
         pass
 
 
-class ChicksTorchVisionDataset(torchvision.datasets.VisionDataset):
+class ChicksVisionDataset(torchvision.datasets.VisionDataset):
     """
     Provides the Chicks4FreeID HuggingFace dataset as a Torchvision dataset.
     The dataset will return a tuple (PIL.Image, target:int)
     """
-    HF_DATASET_DICT = {}
+    from PIL import Image
+    HF_DATASET_DICT: Dict[str, Dataset] = {}
+    TRAIN_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
+    TEST_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
 
     def __init__(
         self,
@@ -813,25 +813,37 @@ class ChicksTorchVisionDataset(torchvision.datasets.VisionDataset):
         train: bool = True,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
+        resize: int = 384,
     ) -> None:
         super().__init__(root, transform=transform, target_transform=target_transform)
+        self.resize = resize
+        self.transform = transform
+        self.target_transform = target_transform
 
-        if not ChicksTorchVisionDataset.HF_DATASET_DICT:
-            ChicksTorchVisionDataset.HF_DATASET_DICT = load_dataset(
+        if not ChicksVisionDataset.HF_DATASET_DICT:
+            ChicksVisionDataset.HF_DATASET_DICT = load_dataset(
                 "dariakern/Chicks4FreeID", 
                 "chicken-re-id-best-visibility", 
-                keep_in_memory=True
             )
+        if not ChicksVisionDataset.TRAIN_DATASET_CACHE:
+            print_rank_zero("Caching train images in memory...")
+            ChicksVisionDataset.TRAIN_DATASET_CACHE = [
+                self._load_row(data) for data in tqdm(ChicksVisionDataset.HF_DATASET_DICT["train"])
+            ]  
+        if not ChicksVisionDataset.TEST_DATASET_CACHE:
+            print_rank_zero("Caching test images in memory...")
+            ChicksVisionDataset.TEST_DATASET_CACHE = [
+                self._load_row(data) for data in tqdm(ChicksVisionDataset.HF_DATASET_DICT["test"])
+            ]
 
-        self.hf_dataset = ChicksTorchVisionDataset.HF_DATASET_DICT["train" if train else "test"]
+        self.cached_data = ChicksVisionDataset.TRAIN_DATASET_CACHE if train else ChicksVisionDataset.TEST_DATASET_CACHE
         
     def __len__(self):
-        return len(self.hf_dataset)
+        return len(self.cached_data)
 
     def __getitem__(self, idx):
-        # Retrieve data at the specified index
-        img, target = self.hf_dataset[idx].values()
-            
+        img, target = self.cached_data[idx]
+        
         if self.transform is not None:
             img = self.transform(img)
 
@@ -840,10 +852,14 @@ class ChicksTorchVisionDataset(torchvision.datasets.VisionDataset):
 
         return img, target
     
+    def _load_row(self, row: Dict[str, Any]) -> Tuple[Image.Image, int]:
+        img, target = row.values()
+        img = img.resize((self.resize, self.resize))
+        return img, target
+
+
     def __str__(self):
         return self
-
-
 
 
 class BenchmarkMethod():
@@ -888,7 +904,7 @@ class BenchmarkMethod():
 
         # Transform for pretaining of the embedding
         self.embedding_train_transform = T.Compose([
-            self.resize_transform,
+            # self.resize_transform,
             T.RandomRotation(360),
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
@@ -897,7 +913,7 @@ class BenchmarkMethod():
 
         # Transform for linear eval training and kkn training
         self.eval_train_transform = T.Compose([
-            self.resize_transform,
+            # self.resize_transform,
             T.RandomRotation(360),
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
@@ -907,29 +923,30 @@ class BenchmarkMethod():
 
         # Transform for all validation datasets
         self.val_transform = T.Compose([
-            self.resize_transform,
+            # self.resize_transform,
             T.ToTensor(),
             self.normalize_transform
         ])
 
 
-        self.embedding_train_dataset = ChicksTorchVisionDataset(
+        self.embedding_train_dataset = ChicksVisionDataset(
             train=True,
             transform=self.embedding_train_transform,
         )
 
-        self.knn_train_dataset = self.linear_train_dataset = ChicksTorchVisionDataset(
+        self.knn_train_dataset = self.linear_train_dataset = ChicksVisionDataset(
             train=True,
             transform=self.eval_train_transform,
         )
    
-        self.knn_val_dataset = self.linear_val_dataset  = self.embedding_val_dataset = ChicksTorchVisionDataset(
+        self.knn_val_dataset = self.linear_val_dataset  = self.embedding_val_dataset = ChicksVisionDataset(
             train=False,
             transform=self.val_transform,
         )
 
-
+    @timing_decorator
     def run_benchmark(self):
+        print_rank_zero(f"## Starting {self.name}... ")
         if self.cfg.checkpoint_path:
             self.model.load_state_dict(torch.load(self.cfg.checkpoint_path)["state_dict"])
 
@@ -947,13 +964,13 @@ class BenchmarkMethod():
             print_rank_zero("Skipping linear evaluation")
         else:
             self.linear_eval()
+        print_rank_zero(f"## Finished {self.name}")
 
 
     def get_embedding_model(self) -> Module:
         "Must return a model that returns features on forward pass."
         return self.model
 
-    
     def knn_eval(self,) -> None:
         """Runs KNN evaluation on the given model.
 
@@ -966,7 +983,7 @@ class BenchmarkMethod():
         References:
         - [0]: InstDict, 2018, https://arxiv.org/abs/1805.01978
         """
-        print_rank_zero(f"██████ Running {self.name} KNN evaluation... ██████")
+        print_rank_zero(f"### Running {self.name} KNN evaluation...")
         
 
         self.train(
@@ -980,7 +997,6 @@ class BenchmarkMethod():
             val_dataset = self.knn_val_dataset,
             log_name="knn_eval",
         )
-
 
     def linear_eval(self,) -> None:
         """Runs a linear evaluation on the given model.
@@ -999,7 +1015,7 @@ class BenchmarkMethod():
         References:
             - [0]: SimCLR, 2020, https://arxiv.org/abs/2002.05709
         """
-        print_rank_zero(f"██████ Running {self.name} linear evaluation... ██████")
+        print_rank_zero(f"### Running {self.name} linear evaluation... ")
 
 
         self.train(
@@ -1016,9 +1032,8 @@ class BenchmarkMethod():
             log_name="linear_eval",
         )
     
-
     def embedding_training(self):
-        print_rank_zero(f"██████ Training {self.name} embedding model... ██████")
+        print_rank_zero(f"### Training {self.name} embedding model... ")
         
         self.train(
             classifier = self.model,
@@ -1029,6 +1044,7 @@ class BenchmarkMethod():
         )
 
 
+    @timing_decorator
     def train(self, classifier, epochs, train_dataset, val_dataset, log_name):
         train_dataloader = DataLoader(
             train_dataset,
@@ -1047,7 +1063,6 @@ class BenchmarkMethod():
             persistent_workers=True,
         )
 
-
         metric_callback = MetricCallback()
         trainer = Trainer(
             max_epochs=epochs if not self.cfg.test_run else 1,
@@ -1062,6 +1077,7 @@ class BenchmarkMethod():
             log_every_n_steps=0,
             precision=self.cfg.precision,
             check_val_every_n_epoch=self.cfg.check_val_every_n_epoch if not self.cfg.test_run else 1,
+            strategy="auto"
         )
 
         trainer.fit(
@@ -1072,8 +1088,6 @@ class BenchmarkMethod():
         for metric in metric_callback.val_metrics.keys():
             print_rank_zero(f"{self.name} {log_name} {metric}: {max(metric_callback.val_metrics[metric])}")
         
-
-
 
 class ResNet50Benchmark(BenchmarkMethod):
     method_specific_augmentation = T.Compose([
@@ -1094,12 +1108,7 @@ class ResNet50Benchmark(BenchmarkMethod):
 
 
     def get_embedding_model(self):
-        return ResNetEmbedding(
-            model=self.model,
-            freeze_model=True,
-        ) 
-
-
+        return ResNetEmbedding(model=self.model) 
 
     
 class MegaDescriptorL384Benchmark(BenchmarkMethod):
@@ -1109,10 +1118,8 @@ class MegaDescriptorL384Benchmark(BenchmarkMethod):
         super().__init__(args)
 
         self.model = MegaDescriptorL384()
-
         self.cfg.skip_embedding_training = True
         self.feature_dim = 1536
-
 
 
 class SwAVBenchmark(BenchmarkMethod):
@@ -1132,14 +1139,11 @@ class SwAVBenchmark(BenchmarkMethod):
         )
 
         self.embedding_train_dataset = LightlyDataset.from_torch_dataset(
-            ChicksTorchVisionDataset(train=True),
+            ChicksVisionDataset(train=True),
             transform=self.embedding_train_transform,
         ) 
 
     
-
-
-
 class Benchmark:
     methods: Dict[str, Type[BenchmarkMethod]] = {
         "resnet50": ResNet50Benchmark,
@@ -1147,20 +1151,18 @@ class Benchmark:
         "swav": SwAVBenchmark,
     }
 
-    
+    @timing_decorator
     def run(self, args):
+        methods = cfg.methods or self.methods.keys()
+        print_rank_zero(f"# Running Benchmarks: {methods}...")   
         cfg = Config(**vars(args))
-    
-        for method in cfg.methods or self.methods.keys():
+        for method in methods:
             if method not in self.methods:
                 raise ValueError(f"Unknown method: {method}. Available methods: {list(self.methods.keys())}")
             else:
-                print_rank_zero(f"██████ Running {method} benchmark... ██████")
                 self.methods[method](cfg).run_benchmark()
+        print_rank_zero(f"# All Benchmarks Done!")   
             
-
-
-
 
 parser = argparse.ArgumentParser(description='Benchmark suite for the paper Chicks4FreeID')
 parser.add_argument("--log-dir", type=Path, default=str(Config.log_dir))
@@ -1180,5 +1182,3 @@ if __name__ == "__main__":
     args = parser.parse_args()
     Benchmark().run(args)
 
-
-    

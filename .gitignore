@@ -1,3 +1,5 @@
 benchmark_logs/
 
+archive/
+
 *.pyc
