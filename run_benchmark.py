@@ -1,7 +1,8 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 from datetime import datetime, timedelta
+import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
@@ -52,7 +53,7 @@ import timm
 @dataclass
 class Config:
     batch_size_per_device: int = 128
-    epochs: int = 500
+    epochs: int = 1000
     num_workers: int = 4
     log_dir: Path = Path("benchmark_logs")
     checkpoint_path: Optional[Path] = None
@@ -66,7 +67,20 @@ class Config:
     precision: str = "16-mixed"
     test_run: bool = False
     check_val_every_n_epoch: int = 5
+    profile=None # "pytorch"
+    experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
+    experiment_id: Optional[str] = None
 
+
+def clear_cache():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+        # MPS doesn't have an explicit empty_cache function, but you can set up custom logic if needed
+        torch.mps.empty_cache()  # For now, do nothing as MPS doesn't provide an empty_cache method
+    else:
+        # CPU - no need to empty cache
+        pass
 
 def timing_decorator(func):
     def wrapper(*args, **kwargs):
@@ -240,6 +254,7 @@ class KNNClassifier(LightningModule):
             }
         )
         self.model = model
+        self.model.eval()
         self.num_classes = num_classes
         self.knn_k = knn_k
         self.knn_t = knn_t
@@ -262,15 +277,16 @@ class KNNClassifier(LightningModule):
         if self.normalize:
             features = F.normalize(features, dim=1)
         features = features.to(self.feature_dtype)
-        self._train_features.append(features.cpu())
-        self._train_targets.append(targets.cpu())
+        self._train_features.append(features.detach().cpu())
+        self._train_targets.append(targets.detach().cpu())
 
     def validation_step(self, batch, batch_idx) -> None:
         if self._train_features_tensor is None or self._train_targets_tensor is None:
             return
 
         images, targets = batch[0], batch[1]
-        features = self.model.forward(images).flatten(start_dim=1)
+        with torch.no_grad():
+            features = self.model.forward(images).flatten(start_dim=1).detach().cpu()
         if self.normalize:
             features = F.normalize(features, dim=1)
         features = features.to(self.feature_dtype)
@@ -289,6 +305,8 @@ class KNNClassifier(LightningModule):
         log_dict = {f"val_top{k}": acc for k, acc in topk.items()}
         log_dict["val_mAP"] = self.map_metric.compute()
         self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=len(targets))
+
+        del images, targets, features, predicted_classes, pred_scores, topk, log_dict
 
     def on_validation_epoch_start(self) -> None:
         if self._train_features and self._train_targets:
@@ -409,47 +427,59 @@ class LinearClassifier(LightningModule):
 
         # Initialize metric for mean average precision.
         self.map_metric = MulticlassAveragePrecision(num_classes=num_classes)
-
+    
     def forward(self, images: Tensor) -> Tensor:
-        if self.freeze_model:
-            with torch.no_grad():
-                features = self.model.forward(images).flatten(start_dim=1)
-        else:
-            features = self.model.forward(images).flatten(start_dim=1)
-        output: Tensor = self.classification_head(features)
+        with torch.set_grad_enabled(not self.freeze_model):
+            features = self.model(images).flatten(start_dim=1)
+        output = self.classification_head(features)
+        del images, features
         return output
 
-    def shared_step(
-        self, batch: Tuple[Tensor, ...], batch_idx: int
-    ) -> Tuple[Tensor, Dict[int, Tensor]]:
+    
+    def shared_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tuple[Tensor, Dict[int, Tensor]]:
         images, targets = batch[0], batch[1]
         predictions = self.forward(images)
         loss = self.criterion(predictions, targets)
-        _, predicted_labels = predictions.topk(max(self.topk))
-        topk = mean_topk_accuracy(predicted_labels, targets, k=self.topk)
-        self.map_metric.update(predictions, targets)
-        mAP = self.map_metric.compute()
-        return loss, topk, mAP
+        _, predicted_labels = predictions.topk(max(self.topk), dim=1)
+        topk = mean_topk_accuracy(predicted_labels.detach().cpu(), targets.detach().cpu(), k=self.topk)
+        self.map_metric.update(predictions.detach().cpu(), targets.detach().cpu())
+
+        del images, targets, predictions, predicted_labels
+        return loss, topk
+
 
     def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
-        loss, topk, mAP = self.shared_step(batch=batch, batch_idx=batch_idx)
-        batch_size = len(batch[1])
-        log_dict = {f"train_top{k}": acc for k, acc in topk.items()}
-        log_dict["train_mAP"] = mAP
-        self.log(
-            "train_loss", loss, prog_bar=True, sync_dist=True, batch_size=batch_size
-        )
-        self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        return loss
+        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
+        batch_size = batch[0].size(0)
 
+        # Detach the tensors you need to log but not to track gradients
+        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
+
+        self.log("train_loss", loss, prog_bar=True, sync_dist=True, batch_size=batch_size)
+        self.log_dict({f"train_top{k}": acc for k, acc in detached_topk.items()}, prog_bar=True, sync_dist=True, batch_size=batch_size)
+        self.log("train_mAP", self.map_metric.compute().detach().cpu(), prog_bar=True, sync_dist=True, batch_size=batch_size)
+
+        # Clear unnecessary variables
+        del batch, topk, detached_topk
+
+        return loss  # Return the loss before deleting it
+
+    
     def validation_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
-        loss, topk, mAP = self.shared_step(batch=batch, batch_idx=batch_idx)
+        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
         batch_size = len(batch[1])
-        log_dict = {f"val_top{k}": acc for k, acc in topk.items()}
-        log_dict["val_mAP"] = mAP
+
+        # Detach the tensors you need to log but not to track gradients
+        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
+
         self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        return loss
+        self.log_dict({f"val_top{k}": acc for k, acc in detached_topk.items()}, prog_bar=True, sync_dist=True, batch_size=batch_size)
+        self.log("val_mAP", self.map_metric.compute().detach().cpu(), prog_bar=True, sync_dist=True, batch_size=batch_size)
+
+        # Clear unnecessary variables
+        del batch, topk, detached_topk
+
+        return loss  # Return the loss before deleting it
 
     def configure_optimizers(
         self,
@@ -491,42 +521,66 @@ class OnlineLinearClassifier(LightningModule):
         dtype: torch.dtype = torch.float32,
     ) -> None:
         super().__init__()
-        self.feature_dim = feature_dim
-        self.num_classes = num_classes
-        self.topk = topk
+        self.save_hyperparameters(ignore="model")
+        self.feature_dim=feature_dim,
+        self.num_classes=num_classes,
+        self.topk=topk
 
         self.classification_head = Linear(feature_dim, num_classes, dtype=dtype)
         self.criterion = CrossEntropyLoss()
 
         # Initialize metric for mean average precision.
         self.map_metric = MulticlassAveragePrecision(num_classes=num_classes)
-
+    
     def forward(self, x: Tensor) -> Tensor:
         return self.classification_head(x.detach().flatten(start_dim=1))
 
-    def shared_step(self, batch, batch_idx) -> Tuple[Tensor, Dict[int, Tensor]]:
-        features, targets = batch[0], batch[1]
-        predictions = self.forward(features)
+    def configure_optimizers(self) -> Tuple[List[Optimizer] | List[Dict[str, Any | str]]]:
+        # No optimization is performed in this class.
+        return None
+
+    def shared_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tuple[Tensor, Dict[int, Tensor]]:
+        images, targets = batch[0], batch[1]
+        predictions = self.forward(images)
         loss = self.criterion(predictions, targets)
-        _, predicted_classes = predictions.topk(max(self.topk))
-        topk = mean_topk_accuracy(predicted_classes, targets, k=self.topk)
-        self.map_metric.update(predictions, targets)
-        mAP = self.map_metric.compute()
-        return loss, topk, mAP
+        _, predicted_labels = predictions.topk(max(self.topk), dim=1)
+        topk = mean_topk_accuracy(predicted_labels.detach().cpu(), targets.detach().cpu(), k=self.topk)
+        self.map_metric.update(predictions.detach().cpu(), targets.detach().cpu())
 
-    def training_step(self, batch, batch_idx) -> Tuple[Tensor, Dict[str, Tensor]]:
-        loss, topk, mAP = self.shared_step(batch=batch, batch_idx=batch_idx)
-        log_dict = {"train_online_cls_loss": loss}
-        log_dict.update({f"train_online_cls_top{k}": acc for k, acc in topk.items()})
-        log_dict["train_online_cls_mAP"] = mAP
-        return loss, log_dict
+        del images, targets, predictions, predicted_labels
+        return loss, topk
 
-    def validation_step(self, batch, batch_idx) -> Tuple[Tensor, Dict[str, Tensor]]:
-        loss, topk, mAP = self.shared_step(batch=batch, batch_idx=batch_idx)
-        log_dict = {"val_online_cls_loss": loss}
-        log_dict.update({f"val_online_cls_top{k}": acc for k, acc in topk.items()})
-        log_dict["val_online_cls_mAP"] = mAP
-        return loss, log_dict
+
+    def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
+        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
+        
+        # Detach the tensors you need to log but not to track gradients
+        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
+
+        log_dict = {f"train_top{k}": acc for k, acc in detached_topk.items()}
+        log_dict["train_mAP"] = self.map_metric.compute().detach().cpu()
+        log_dict["train_loss"] = loss
+
+        # Clear unnecessary variables
+        del batch, topk, detached_topk
+
+        return loss, log_dict  # Return the loss before deleting it
+
+    
+    def validation_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
+        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
+        
+        # Detach the tensors you need to log but not to track gradients
+        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
+
+        log_dict = {f"val_top{k}": acc for k, acc in detached_topk.items()}
+        log_dict["val_mAP"] = self.map_metric.compute().detach().cpu()
+        log_dict["val_loss"] = loss
+
+        # Clear unnecessary variables
+        del batch, topk, detached_topk
+
+        return loss, log_dict  # Return the loss before deleting it
 
 
 class SwAV(LightningModule):
@@ -630,17 +684,22 @@ class SwAV(LightningModule):
             (multi_crop_features[0].detach(), targets), batch_idx
         )
         self.log_dict(cls_log, prog_bar=True, sync_dist=True, batch_size=len(targets))
+        
+        del multi_crops, targets, multi_crop_features, multi_crop_projections, queue_crop_logits, multi_crop_logits, cls_log
         return loss + cls_loss
 
     def validation_step(
         self, batch: Tuple[Tensor, Tensor, List[str]], batch_idx: int
     ) -> Tensor:
         images, targets = batch[0], batch[1]
-        features = self.forward(images).flatten(start_dim=1)
+        with torch.no_grad():
+            features = self.forward(images).flatten(start_dim=1)
         cls_loss, cls_log = self.online_classifier.validation_step(
             (features.detach(), targets), batch_idx
         )
         self.log_dict(cls_log, prog_bar=True, sync_dist=True, batch_size=len(targets))
+
+        del images, targets, features, cls_log
         return cls_loss
 
     def configure_optimizers(self):
@@ -670,15 +729,20 @@ class SwAV(LightningModule):
             momentum=0.9,
             weight_decay=1e-6,
         )
+        print_rank_zero(f"Estimated steps: {self.trainer.estimated_stepping_batches}")
+        warump_steps = int(
+            self.trainer.estimated_stepping_batches
+            / (self.trainer.max_epochs * 10)
+        )
+        print_rank_zero(f"Warmup steps: {warump_steps}")
+        max_steps = self.trainer.estimated_stepping_batches
+        print_rank_zero(f"Max steps: {max_steps}")
+
         scheduler = {
             "scheduler": CosineWarmupScheduler(
                 optimizer=optimizer,
-                warmup_epochs=int(
-                    self.trainer.estimated_stepping_batches
-                    / self.trainer.max_epochs
-                    * 10
-                ),
-                max_epochs=int(self.trainer.estimated_stepping_batches),
+                warmup_epochs=warump_steps,
+                max_epochs=max_steps,
                 end_value=0.0006
                 * (self.batch_size_per_device * self.trainer.world_size)
                 / 256,
@@ -756,6 +820,7 @@ class ResNetEmbedding(LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore="model")
         self.model = model.model
+        self.model.eval()
 
     def forward(self, images: Tensor) -> Tensor:
         with torch.no_grad():
@@ -836,13 +901,18 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
                 self._load_row(data) for data in tqdm(ChicksVisionDataset.HF_DATASET_DICT["test"])
             ]
 
-        self.cached_data = ChicksVisionDataset.TRAIN_DATASET_CACHE if train else ChicksVisionDataset.TEST_DATASET_CACHE
+        self.split = "train" if train else "test"
         
     def __len__(self):
-        return len(self.cached_data)
+        return len(self._cached_data())
 
+    def _cached_data(self):
+        if self.split == "train":
+            return ChicksVisionDataset.TRAIN_DATASET_CACHE
+        return ChicksVisionDataset.TEST_DATASET_CACHE
+        
     def __getitem__(self, idx):
-        img, target = self.cached_data[idx]
+        img, target = self._cached_data()[idx]
         
         if self.transform is not None:
             img = self.transform(img)
@@ -899,7 +969,7 @@ class BenchmarkMethod():
         self.cfg = cfg
         self.name = self.name or self.__class__.__name__
 
-        self.method_dir = self.cfg.log_dir / self.name / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.method_dir = self.cfg.log_dir / self.cfg.experiment_id / self.name 
         self.method_dir = self.method_dir.resolve()
 
         # Transform for pretaining of the embedding
@@ -948,8 +1018,11 @@ class BenchmarkMethod():
     def run_benchmark(self):
         print_rank_zero(f"## Starting {self.name}... ")
         if self.cfg.checkpoint_path:
+            if self.cfg.methods is None or not self.cfg.methods or len(self.cfg.methods) != 1:
+                raise ValueError("Checkpoint loading only supported for single method benchmarks")
             self.model.load_state_dict(torch.load(self.cfg.checkpoint_path)["state_dict"])
 
+        
         if self.cfg.skip_embedding_training or self.cfg.epochs == 0:
             print_rank_zero("Skipping training")
         else:
@@ -964,6 +1037,8 @@ class BenchmarkMethod():
             print_rank_zero("Skipping linear evaluation")
         else:
             self.linear_eval()
+        del self.model
+        clear_cache()
         print_rank_zero(f"## Finished {self.name}")
 
 
@@ -984,8 +1059,7 @@ class BenchmarkMethod():
         - [0]: InstDict, 2018, https://arxiv.org/abs/1805.01978
         """
         print_rank_zero(f"### Running {self.name} KNN evaluation...")
-        
-
+    
         self.train(
             classifier = KNNClassifier(
                 model=self.get_embedding_model(),
@@ -1074,10 +1148,14 @@ class BenchmarkMethod():
                 metric_callback,
             ],
             num_sanity_val_steps=0,
-            log_every_n_steps=0,
+            log_every_n_steps=1,
             precision=self.cfg.precision,
-            check_val_every_n_epoch=self.cfg.check_val_every_n_epoch if not self.cfg.test_run else 1,
-            strategy="auto"
+            check_val_every_n_epoch=min(
+                epochs, 
+                (self.cfg.check_val_every_n_epoch if not self.cfg.test_run else 1)
+            ),
+            strategy="auto",
+            profiler=self.cfg.profile,
         )
 
         trainer.fit(
@@ -1086,7 +1164,20 @@ class BenchmarkMethod():
             val_dataloaders=val_dataloader,
         )
         for metric in metric_callback.val_metrics.keys():
-            print_rank_zero(f"{self.name} {log_name} {metric}: {max(metric_callback.val_metrics[metric])}")
+            max_value = max(metric_callback.val_metrics[metric])
+            print_rank_zero(f"{self.name} {log_name} {metric}: {max_value}")
+            if "train" not in metric and "loss" not in metric:
+                self.cfg.experiment_result_metrics.append({
+                    "Setting": self.name,
+                    "Evaluation": log_name,
+                    "Metric": metric,
+                    "Value": max_value,
+                })
+                result_metrics_dir = self.cfg.log_dir / self.cfg.experiment_id
+                result_metrics = pd.DataFrame(self.cfg.experiment_result_metrics)
+                result_metrics.to_csv(result_metrics_dir / "metrics.csv", index=False)
+                result_metrics.to_markdown(result_metrics_dir / "metrics.md", index=False)
+                
         
 
 class ResNet50Benchmark(BenchmarkMethod):
@@ -1146,14 +1237,15 @@ class SwAVBenchmark(BenchmarkMethod):
     
 class Benchmark:
     methods: Dict[str, Type[BenchmarkMethod]] = {
+        "swav": SwAVBenchmark,
         "resnet50": ResNet50Benchmark,
         "mega_descriptor": MegaDescriptorL384Benchmark,
-        "swav": SwAVBenchmark,
     }
 
     @timing_decorator
     def run(self, args):
         cfg = Config(**vars(args))
+        cfg.experiment_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         methods = cfg.methods or self.methods.keys()
         print_rank_zero(f"# Running Benchmarks: {list(methods)}...")   
         for method in methods:
@@ -1161,7 +1253,7 @@ class Benchmark:
                 raise ValueError(f"Unknown method: {method}. Available methods: {list(self.methods.keys())}")
             else:
                 self.methods[method](cfg).run_benchmark()
-        print_rank_zero(f"# All Benchmarks Done!")   
+        print_rank_zero(f"# All Benchmarks Done!") 
             
 
 parser = argparse.ArgumentParser(description='Benchmark suite for the paper Chicks4FreeID')

@@ -3,5 +3,10 @@ lightly==1.5.2
 matplotlib==3.8.4
 # scikit-learn==1.4.1.post1
 tensorboard==2.16.2
+tensorboardX==2.6.2.2
+torch-tb-profiler==0.4.3
 timm==0.9.16
 torchaudio==2.3.0
+tabulate==0.9.0
+torch==2.3.0
+pandas==2.2.2
