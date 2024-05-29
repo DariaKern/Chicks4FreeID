@@ -64,7 +64,7 @@ class Config:
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = True
+    test_run: bool = False
     check_val_every_n_epoch: int = 5
 
 
@@ -1153,9 +1153,9 @@ class Benchmark:
 
     @timing_decorator
     def run(self, args):
-        methods = cfg.methods or self.methods.keys()
-        print_rank_zero(f"# Running Benchmarks: {methods}...")   
         cfg = Config(**vars(args))
+        methods = cfg.methods or self.methods.keys()
+        print_rank_zero(f"# Running Benchmarks: {list(methods)}...")   
         for method in methods:
             if method not in self.methods:
                 raise ValueError(f"Unknown method: {method}. Available methods: {list(self.methods.keys())}")
