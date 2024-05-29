@@ -1,5 +1,5 @@
 import argparse
-from dataclasses import Field, dataclass, field
+from dataclasses import dataclass
 import time
 from datetime import datetime, timedelta
 from tqdm import tqdm

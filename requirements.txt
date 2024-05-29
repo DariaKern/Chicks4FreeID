@@ -1,0 +1,7 @@
+datasets==2.19.1
+lightly==1.5.2
+matplotlib==3.8.4
+# scikit-learn==1.4.1.post1
+tensorboard==2.16.2
+timm==0.9.16
+torchaudio==2.3.0
