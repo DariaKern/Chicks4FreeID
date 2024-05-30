@@ -55,7 +55,7 @@ class Config:
     batch_size_per_device: int = 128
     epochs: int = 1000
     num_workers: int = 4
-    log_dir: Path = Path("benchmark_logs")
+    log_dir: Path = Path("baseline_logs")
     checkpoint_path: Optional[Path] = Path("benchmark_logs/2024-05-30_00-30-38/SwAVBenchmark/embedding_training/version_0/checkpoints/epoch=999-step=4000.ckpt")
     num_classes: int = 50
     skip_embedding_training: bool = False
@@ -69,7 +69,7 @@ class Config:
     check_val_every_n_epoch: int = 5
     profile=None # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
-    experiment_id: Optional[str] = None
+    baseline_id: Optional[str] = None
 
 
 def clear_cache():
@@ -187,7 +187,7 @@ class KNNClassifier(LightningModule):
         feature_dtype: torch.dtype = torch.float32,
         normalize: bool = True,
     ):
-        """KNN classifier for benchmarking.
+        """KNN classifier to compute baseline performance of embedding models.
 
         Settings based on InstDisc [0]. Code adapted from MoCo [1].
 
@@ -361,7 +361,7 @@ class LinearClassifier(LightningModule):
         topk: Tuple[int, ...] = (1, 5),
         freeze_model: bool = False,
     ) -> None:
-        """Linear classifier for benchmarking.
+        """Linear classifier for computing baseline performance.
 
         Settings based on SimCLR [0].
 
@@ -792,7 +792,7 @@ def _update_queue(
 
 class ResNet50Classifier(LinearClassifier):
     """
-    A ResNet50 classifier for benchmarking the fully supervised setting.
+    A ResNet50 classifier to compute baseline metrics of a fully supervised setting.
     """
     def __init__(
         self,
@@ -802,8 +802,6 @@ class ResNet50Classifier(LinearClassifier):
         topk: Tuple[int, ...] = (1, 5),
         freeze_model: bool = False,
     ) -> None:
-        """ResNet50 classifier for benchmarking fully supervised setting. Inherits from LinearClassifier 
-        """
         super().__init__(
             model=None,
             feature_dim=feature_dim,
@@ -846,7 +844,7 @@ class ResNetEmbedding(LightningModule):
 class MegaDescriptorL384(LightningModule):
     """
     A pretrained-model that uses the MegaDescriptor-L-384 model from the HuggingFace model hub
-    to benchmark the unsupervised setting.
+    to compute baseline metrics of an unsupervised setting.
 
     The model is not finetuned and only used to extract features.
 
@@ -943,11 +941,11 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
         return self
 
 
-class BenchmarkMethod():
+class BaselineMethod():
     """
-    An abstract class that defines common methods for a benchmarking methods.
+    An abstract class that holds common code of our baseline methods.
 
-    The class runs a benchmarking pipeline that consists of:
+    The class runs:
         - embedding training
         - kNN evaluation
         - linear evaluation
@@ -957,8 +955,8 @@ class BenchmarkMethod():
         - Top-5 accuracy
         - Mean Average Precision (mAP)
 
-    The benchmark can be configured by inheriting from this class and overriding specifics
-    as well as passing a Config object.
+    The baseline method can be configured by inheriting from this class and overriding specific
+    attributes or functions as well as passing a config object.
     """
     embedding_train_dataset: Iterable[Tuple[Tensor, Tensor]]
     embedding_val_dataset: Iterable[Tuple[Tensor, Tensor]]
@@ -971,16 +969,18 @@ class BenchmarkMethod():
     resize_transform = T.Resize(384)
     method_specific_augmentation = T.Compose([])
     
-    name: str = ""
-    cfg: Config
-    model: Module
-    feature_dim: int = 2048
+    cfg: Config                            # A config class specifying the hyperparameters
+    model: Module                          # The model used for embedding training
+    feature_dim: int = 2048                # Important for the linear evaluation
+    skip_embedding_training: bool = False  # Overwrites self.cfg.skip_embedding_training
+    
+    _name: str = ""                         # Name property. Will return the class name if not set
+
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.name = self.name or self.__class__.__name__
 
-        self.method_dir = self.cfg.log_dir / self.cfg.experiment_id / self.name 
+        self.method_dir = self.cfg.log_dir / self.cfg.baseline_id / self.name 
         self.method_dir = self.method_dir.resolve()
 
         # Transform for pretaining of the embedding
@@ -1025,8 +1025,12 @@ class BenchmarkMethod():
             transform=self.val_transform,
         )
 
+    @property
+    def name(self) -> str:
+        return self._name or self.__class__.__name__
+
     @timing_decorator
-    def run_benchmark(self):
+    def run_baseline_method(self):
         print_rank_zero(f"## Starting {self.name}... ")
         loaded_checkpoint = False
         if self.cfg.checkpoint_path:
@@ -1038,7 +1042,7 @@ class BenchmarkMethod():
                 print_rank_zero(f"Loaded checkpoint for {self.name} from {self.cfg.checkpoint_path}")
 
 
-        if self.cfg.skip_embedding_training or self.cfg.epochs == 0 or loaded_checkpoint:
+        if self.cfg.skip_embedding_training or self.cfg.epochs == 0 or loaded_checkpoint or self.skip_embedding_training:
             print_rank_zero("Skipping embedding training")
         else:
             self.embedding_training()
@@ -1191,14 +1195,14 @@ class BenchmarkMethod():
             "Evaluation": log_name,
             **metrics
         })
-        result_metrics_dir = self.cfg.log_dir / self.cfg.experiment_id
+        result_metrics_dir = self.cfg.log_dir / self.cfg.baseline_id
         result_metrics = pd.DataFrame(self.cfg.experiment_result_metrics)
         result_metrics.to_csv(result_metrics_dir / "metrics.csv", index=False)
         result_metrics.to_markdown(result_metrics_dir / "metrics.md", index=False)
                 
         
 
-class ResNet50Benchmark(BenchmarkMethod):
+class ResNet50Baseline(BaselineMethod):
     method_specific_augmentation = T.Compose([
         T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
         T.ToTensor(),
@@ -1220,18 +1224,18 @@ class ResNet50Benchmark(BenchmarkMethod):
         return ResNetEmbedding(model=self.model) 
 
     
-class MegaDescriptorL384Benchmark(BenchmarkMethod):
+class MegaDescriptorL384Baseline(BaselineMethod):
     normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
 
     def __init__(self, args):
         super().__init__(args)
 
         self.model = MegaDescriptorL384()
-        self.cfg.skip_embedding_training = True
+        self.skip_embedding_training = True
         self.feature_dim = 1536
 
 
-class SwAVBenchmark(BenchmarkMethod):
+class SwAVBaseline(BaselineMethod):
     method_specific_augmentation = SwaVTransform(
         rr_prob=0.5,
         rr_degrees=360,
@@ -1253,26 +1257,26 @@ class SwAVBenchmark(BenchmarkMethod):
         ) 
 
     
-class Benchmark:
-    methods: Dict[str, Type[BenchmarkMethod]] = {
-        "swav": SwAVBenchmark,
-        "resnet50": ResNet50Benchmark,
-        "mega_descriptor": MegaDescriptorL384Benchmark,
+class Baseline:
+    methods: Dict[str, Type[BaselineMethod]] = {
+        "swav": SwAVBaseline,
+        "resnet50": ResNet50Baseline,
+        "mega_descriptor": MegaDescriptorL384Baseline,
     }
 
     @timing_decorator
     def run(self, args):
         cfg = Config(**vars(args))
-        cfg.experiment_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        cfg.baseline_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         methods = cfg.methods or self.methods.keys()
-        print_rank_zero(f"# Running Benchmarks: {list(methods)}...")   
+        print_rank_zero(f"# Running: {", ".join(methods)}...")   
         for method in methods:
             if method not in self.methods:
-                raise ValueError(f"Unknown method: {method}. Available methods: {list(self.methods.keys())}")
+                raise ValueError(f"Unknown method: {method}. Available methods: {", ".join(self.methods.keys())}")
             else:
-                self.methods[method](cfg).run_benchmark()
+                self.methods[method](cfg).run_baseline_method()
         print_rank_zero(f"# All baselines metrics computed!")
-        print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.experiment_id}") 
+        print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.baseline_id}") 
             
 
 parser = argparse.ArgumentParser(description='Baseline metrics for the paper Chicks4FreeID')
@@ -1291,5 +1295,5 @@ parser.add_argument("--test-run", action="store_true", default=Config.test_run)
 
 if __name__ == "__main__":
     args = parser.parse_args()
-    Benchmark().run(args)
+    Baseline().run(args)
 
