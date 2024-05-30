@@ -56,7 +56,7 @@ class Config:
     epochs: int = 1000
     num_workers: int = 4
     log_dir: Path = Path("benchmark_logs")
-    checkpoint_path: Optional[Path] = None
+    checkpoint_path: Optional[Path] = Path("benchmark_logs/2024-05-30_00-30-38/SwAVBenchmark/embedding_training/version_0/checkpoints/epoch=999-step=4000.ckpt")
     num_classes: int = 50
     skip_embedding_training: bool = False
     skip_knn_eval: bool = False
@@ -286,7 +286,7 @@ class KNNClassifier(LightningModule):
 
         images, targets = batch[0], batch[1]
         with torch.no_grad():
-            features = self.model.forward(images).flatten(start_dim=1).detach().cpu()
+            features = self.model.forward(images).flatten(start_dim=1)
         if self.normalize:
             features = F.normalize(features, dim=1)
         features = features.to(self.feature_dtype)
@@ -338,6 +338,14 @@ class KNNClassifier(LightningModule):
         # configure_optimizers must be implemented for PyTorch Lightning. Returning None
         # means that no optimization is performed.
         pass
+
+    def on_validation_end(self) -> None:
+        super().on_validation_end()
+        # Clear the cache after each validation epoch to prevent memory leaks.
+        del self._train_features_tensor
+        del self._train_targets_tensor
+        del self._train_features
+        del self._train_targets
 
 
 class LinearClassifier(LightningModule):
@@ -731,8 +739,10 @@ class SwAV(LightningModule):
         )
         print_rank_zero(f"Estimated steps: {self.trainer.estimated_stepping_batches}")
         warump_steps = int(
-            self.trainer.estimated_stepping_batches
-            / (self.trainer.max_epochs * 10)
+            min(
+                self.trainer.estimated_stepping_batches / 10,
+                self.trainer.estimated_stepping_batches / self.trainer.max_epochs * 10,
+            )
         )
         print_rank_zero(f"Warmup steps: {warump_steps}")
         max_steps = self.trainer.estimated_stepping_batches
@@ -862,15 +872,17 @@ class MegaDescriptorL384(LightningModule):
         pass
 
 
+from PIL import Image
+HF_DATASET_DICT: Dict[str, Dataset] = {}
+TRAIN_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
+TEST_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
+
+
 class ChicksVisionDataset(torchvision.datasets.VisionDataset):
     """
     Provides the Chicks4FreeID HuggingFace dataset as a Torchvision dataset.
     The dataset will return a tuple (PIL.Image, target:int)
     """
-    from PIL import Image
-    HF_DATASET_DICT: Dict[str, Dataset] = {}
-    TRAIN_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
-    TEST_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
 
     def __init__(
         self,
@@ -880,39 +892,38 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
         target_transform: Optional[Callable] = None,
         resize: int = 384,
     ) -> None:
+        global HF_DATASET_DICT, TRAIN_DATASET_CACHE, TEST_DATASET_CACHE
         super().__init__(root, transform=transform, target_transform=target_transform)
         self.resize = resize
         self.transform = transform
         self.target_transform = target_transform
 
-        if not ChicksVisionDataset.HF_DATASET_DICT:
-            ChicksVisionDataset.HF_DATASET_DICT = load_dataset(
+        if not HF_DATASET_DICT:
+            HF_DATASET_DICT = load_dataset(
                 "dariakern/Chicks4FreeID", 
                 "chicken-re-id-best-visibility", 
             )
-        if not ChicksVisionDataset.TRAIN_DATASET_CACHE:
+        if not TRAIN_DATASET_CACHE:
             print_rank_zero("Caching train images in memory...")
-            ChicksVisionDataset.TRAIN_DATASET_CACHE = [
-                self._load_row(data) for data in tqdm(ChicksVisionDataset.HF_DATASET_DICT["train"])
+            TRAIN_DATASET_CACHE = [
+                self._load_row(data) for data in tqdm(HF_DATASET_DICT["train"])
             ]  
-        if not ChicksVisionDataset.TEST_DATASET_CACHE:
+        if not TEST_DATASET_CACHE:
             print_rank_zero("Caching test images in memory...")
-            ChicksVisionDataset.TEST_DATASET_CACHE = [
-                self._load_row(data) for data in tqdm(ChicksVisionDataset.HF_DATASET_DICT["test"])
+            TEST_DATASET_CACHE = [
+                self._load_row(data) for data in tqdm(HF_DATASET_DICT["test"])
             ]
 
-        self.split = "train" if train else "test"
+        self.split = TRAIN_DATASET_CACHE if train else TEST_DATASET_CACHE
         
     def __len__(self):
-        return len(self._cached_data())
+        return len(self.split)
 
-    def _cached_data(self):
-        if self.split == "train":
-            return ChicksVisionDataset.TRAIN_DATASET_CACHE
-        return ChicksVisionDataset.TEST_DATASET_CACHE
         
     def __getitem__(self, idx):
-        img, target = self._cached_data()[idx]
+        if idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for dataset of length {len(self)} ")
+        img, target = self.split[idx]
         
         if self.transform is not None:
             img = self.transform(img)
@@ -1017,14 +1028,18 @@ class BenchmarkMethod():
     @timing_decorator
     def run_benchmark(self):
         print_rank_zero(f"## Starting {self.name}... ")
+        loaded_checkpoint = False
         if self.cfg.checkpoint_path:
-            if self.cfg.methods is None or not self.cfg.methods or len(self.cfg.methods) != 1:
-                raise ValueError("Checkpoint loading only supported for single method benchmarks")
-            self.model.load_state_dict(torch.load(self.cfg.checkpoint_path)["state_dict"])
+            if self.name not in str(self.cfg.checkpoint_path):
+                print_rank_zero(f"Not loading checkpoint for {self.name} because checkpoint path does not contain '{self.name}'.")
+            else:
+                self.model.load_state_dict(torch.load(self.cfg.checkpoint_path)["state_dict"])
+                loaded_checkpoint = True
+                print_rank_zero(f"Loaded checkpoint for {self.name} from {self.cfg.checkpoint_path}")
 
-        
-        if self.cfg.skip_embedding_training or self.cfg.epochs == 0:
-            print_rank_zero("Skipping training")
+
+        if self.cfg.skip_embedding_training or self.cfg.epochs == 0 or loaded_checkpoint:
+            print_rank_zero("Skipping embedding training")
         else:
             self.embedding_training()
         
@@ -1166,17 +1181,20 @@ class BenchmarkMethod():
         for metric in metric_callback.val_metrics.keys():
             max_value = max(metric_callback.val_metrics[metric])
             print_rank_zero(f"{self.name} {log_name} {metric}: {max_value}")
-            if "train" not in metric and "loss" not in metric:
-                self.cfg.experiment_result_metrics.append({
-                    "Setting": self.name,
-                    "Evaluation": log_name,
-                    "Metric": metric,
-                    "Value": max_value,
-                })
-                result_metrics_dir = self.cfg.log_dir / self.cfg.experiment_id
-                result_metrics = pd.DataFrame(self.cfg.experiment_result_metrics)
-                result_metrics.to_csv(result_metrics_dir / "metrics.csv", index=False)
-                result_metrics.to_markdown(result_metrics_dir / "metrics.md", index=False)
+        metrics = {
+            metric: value
+            for metric, value in metric_callback.val_metrics.items()
+            if "train" not in metric and "loss" not in metric
+        }
+        self.cfg.experiment_result_metrics.append({
+            "Setting": self.name,
+            "Evaluation": log_name,
+            **metrics
+        })
+        result_metrics_dir = self.cfg.log_dir / self.cfg.experiment_id
+        result_metrics = pd.DataFrame(self.cfg.experiment_result_metrics)
+        result_metrics.to_csv(result_metrics_dir / "metrics.csv", index=False)
+        result_metrics.to_markdown(result_metrics_dir / "metrics.md", index=False)
                 
         
 
@@ -1253,10 +1271,11 @@ class Benchmark:
                 raise ValueError(f"Unknown method: {method}. Available methods: {list(self.methods.keys())}")
             else:
                 self.methods[method](cfg).run_benchmark()
-        print_rank_zero(f"# All Benchmarks Done!") 
+        print_rank_zero(f"# All baselines metrics computed!")
+        print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.experiment_id}") 
             
 
-parser = argparse.ArgumentParser(description='Benchmark suite for the paper Chicks4FreeID')
+parser = argparse.ArgumentParser(description='Baseline metrics for the paper Chicks4FreeID')
 parser.add_argument("--log-dir", type=Path, default=str(Config.log_dir))
 parser.add_argument("--batch-size-per-device", type=int, default=Config.batch_size_per_device) #default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=Config.epochs)

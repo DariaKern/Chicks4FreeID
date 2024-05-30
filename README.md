@@ -7,25 +7,25 @@ COMING SOON
 ## Papers and systems citing the Chicks4FreeID dataset
 coming soon ...
 
-## Replicate the benchmmark
+## Replicate the baseline metrics
 
 ```shell
 git clone https://github.com/DariaKern/Chicks4FreeID
 cd Chicks4FreeID
 pip install requirements.txt
-python run_benchmark.py
+python run_baseline.py
 ```
 
 You can pass different options, depending on your hardware configuration
 
 ```shell
-python run_benchmark.py --devices=4 --batch-size-per-device=128 
+python run_baseline.py --devices=4 --batch-size-per-device=128 
 ```
 
 For a full list of arguments type
 
 ```shell
-python run_benchmark.py --help
+python run_baseline.py --help
 ```
 
 In a sepearte shell, open tensorboard to view progress and results
