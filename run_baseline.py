@@ -20,6 +20,7 @@ from torch.nn import (
     ModuleList,
 )
 from torch.optim import SGD, Optimizer
+from torch.optim.lr_scheduler import ReduceLROnPlateau 
 from torch.utils.data import DataLoader
 from torchvision.models import resnet50
 from torchmetrics.classification import MulticlassAveragePrecision
@@ -65,7 +66,7 @@ class Config:
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = False
+    test_run: bool = True
     check_val_every_n_epoch: int = 5
     profile=None # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
@@ -816,6 +817,32 @@ class ResNet50Classifier(LinearClassifier):
         self.model.fc = Identity()
         self.classification_head = fc
 
+    def configure_optimizers(
+        self,
+    ) -> Tuple[List[Optimizer], List[Dict[str, Union[Any, str]]]]:
+        parameters = list(self.classification_head.parameters())
+        if not self.freeze_model:
+            parameters += self.model.parameters()
+        # SGD with momentum and weight decay.
+        optimizer = SGD(
+            parameters,
+            lr=1, # Start with high learning rate, because we have RedLRonPlateau
+            momentum=0.9,
+            weight_decay=1e-2,
+        )
+        # Reduce Learning Rate on Plateau
+        scheduler = {
+            "scheduler": ReduceLROnPlateau(
+                optimizer=optimizer,
+                mode="min",
+                factor=0.5,
+                patience=5,
+                verbose=True,
+            ),
+            "interval": "epoch",
+            "monitor": "train_loss",
+        }
+        return [optimizer], [scheduler]
 
 class ResNetEmbedding(LightningModule):
     """
@@ -1041,8 +1068,13 @@ class BaselineMethod():
                 loaded_checkpoint = True
                 print_rank_zero(f"Loaded checkpoint for {self.name} from {self.cfg.checkpoint_path}")
 
-
-        if self.cfg.skip_embedding_training or self.cfg.epochs == 0 or loaded_checkpoint or self.skip_embedding_training:
+        skip_embedding_training = (
+            self.cfg.skip_embedding_training 
+            or self.cfg.epochs == 0 
+            or loaded_checkpoint 
+            or self.skip_embedding_training
+        )
+        if skip_embedding_training:
             print_rank_zero("Skipping embedding training")
         else:
             self.embedding_training()
@@ -1182,9 +1214,13 @@ class BaselineMethod():
             train_dataloaders=train_dataloader,
             val_dataloaders=val_dataloader,
         )
+
+        # Print the current run results
         for metric in metric_callback.val_metrics.keys():
             max_value = max(metric_callback.val_metrics[metric])
             print_rank_zero(f"{self.name} {log_name} {metric}: {max_value}")
+        
+        # Update the metric values in a markdown and csv file
         metrics = {
             metric: value
             for metric, value in metric_callback.val_metrics.items()
@@ -1198,7 +1234,7 @@ class BaselineMethod():
         result_metrics_dir = self.cfg.log_dir / self.cfg.baseline_id
         result_metrics = pd.DataFrame(self.cfg.experiment_result_metrics)
         result_metrics.to_csv(result_metrics_dir / "metrics.csv", index=False)
-        result_metrics.to_markdown(result_metrics_dir / "metrics.md", index=False)
+        result_metrics.to_markdown(result_metrics_dir / "metrics.md", index=False, floatfmt=".4f")
                 
         
 
@@ -1268,15 +1304,13 @@ class Baseline:
     def run(self, args):
         cfg = Config(**vars(args))
         cfg.baseline_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        methods = cfg.methods or self.methods.keys()
-        print_rank_zero(f"# Running: {", ".join(methods)}...")   
+        methods = cfg.methods or list(self.methods.keys())
+        print_rank_zero(f"# Running: {methods}...")   
         for method in methods:
-            if method not in self.methods:
-                raise ValueError(f"Unknown method: {method}. Available methods: {", ".join(self.methods.keys())}")
-            else:
-                self.methods[method](cfg).run_baseline_method()
+            self.methods[method](cfg).run_baseline_method()
         print_rank_zero(f"# All baselines metrics computed!")
         print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.baseline_id}") 
+            
             
 
 parser = argparse.ArgumentParser(description='Baseline metrics for the paper Chicks4FreeID')
@@ -1285,7 +1319,7 @@ parser.add_argument("--batch-size-per-device", type=int, default=Config.batch_si
 parser.add_argument("--epochs", type=int, default=Config.epochs)
 parser.add_argument("--num-workers", type=int, default=Config.num_workers)
 parser.add_argument("--checkpoint-path", type=Path, default=Config.checkpoint_path)
-parser.add_argument("--methods", type=str, nargs="+", default=Config.methods)
+parser.add_argument("--methods", type=str, nargs="+", default=Config.methods, choices=Baseline.methods.keys(), required=False)
 parser.add_argument("--num-classes", type=int, default=Config.num_classes)
 parser.add_argument("--skip-embedding-training", action="store_true", default=Config.skip_embedding_training)
 parser.add_argument("--skip-knn-eval", action="store_true", default=Config.skip_knn_eval)
