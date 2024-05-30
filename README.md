@@ -34,7 +34,7 @@ python run_baseline.py --help
 In a sepearte shell, open tensorboard to view progress and results
 
 ```shell
-tensorboard --logdir benchmark_logs
+tensorboard --logdir baseline_logs
 ```
 
 > [!IMPORTANT]

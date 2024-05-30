@@ -57,7 +57,7 @@ class Config:
     epochs: int = 1000
     num_workers: int = 4
     log_dir: Path = Path("baseline_logs")
-    checkpoint_path: Optional[Path] = Path("benchmark_logs/2024-05-30_00-30-38/SwAVBenchmark/embedding_training/version_0/checkpoints/epoch=999-step=4000.ckpt")
+    checkpoint_path: Optional[Path] = None
     num_classes: int = 50
     skip_embedding_training: bool = False
     skip_knn_eval: bool = False
@@ -66,9 +66,9 @@ class Config:
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = True
+    test_run: bool = False
     check_val_every_n_epoch: int = 5
-    profile=None # "pytorch"
+    profile= None  # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
     baseline_id: Optional[str] = None
 
@@ -927,6 +927,7 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
             HF_DATASET_DICT = load_dataset(
                 "dariakern/Chicks4FreeID", 
                 "chicken-re-id-best-visibility", 
+                download_mode="reuse_cache_if_exists"
             )
         if not TRAIN_DATASET_CACHE:
             print_rank_zero("Caching train images in memory...")
