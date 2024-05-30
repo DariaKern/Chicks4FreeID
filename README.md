@@ -4,10 +4,7 @@ COMING SOON
 
 <img src="./wiki/chickenDataset.png">
 
-## Papers and systems citing the Chicks4FreeID dataset
-coming soon ...
-
-## Replicate the baseline metrics
+## Replicate the baseline
 
 ```shell
 git clone https://github.com/DariaKern/Chicks4FreeID
@@ -37,6 +34,12 @@ tensorboard --logdir benchmark_logs
 > [!IMPORTANT]
 > Differnt low-level accelerator implementations (TPU, MPS, CUDA) yield different results. The original hardware config for the results reported in the paper is based on the MPS implementation accessible on a 64GB Apple M3 Max chip (2023).
 
+
+## Timeline
+[2024/05/23] the first version of the dataset was uploaded to Hugging Face.
+
+## Papers and systems citing the Chicks4FreeID dataset
+coming soon ...
 
 ## Citation
 ```tex
