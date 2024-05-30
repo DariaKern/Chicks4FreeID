@@ -1,8 +1,30 @@
-# 🐓 Chicks4FreeID
+# 🐔 Chicks4FreeID
 The very first publicly available chicken re-identification dataset
-COMING SOON
+is available on 🤗 **Hugging Face**: [huggingface.co/datasets/dariakern/Chicks4FreeID](https://huggingface.co/datasets/dariakern/Chicks4FreeID)
 
 <img src="./wiki/chickenDataset.png">
+
+
+## 🤗 Usage
+
+```shell
+pip install datasets
+```
+
+```python
+from datasets import load_dataset
+train_ds = load_dataset("dariakern/Chicks4FreeID", split="train")
+train_ds[0]
+```
+
+```python
+{'crop': <PIL.PngImagePlugin.PngImageFile image mode=RGB size=2630x2630 at 0x7AA95E7D1720>,
+ 'identity': 43}
+```
+
+
+> [!TIP]
+> Find more information on how to work with 🤗 datasets [here]()
 
 
 ## 📊 Baseline
@@ -42,7 +64,8 @@ tensorboard --logdir baseline_logs
 
 
 ## ⏳ Timeline
-[2024/05/23] the first version of the dataset was uploaded to Hugging Face.
+- [2024/05/30] DOI created: [https://doi.org/10.57967/hf/2345](https://doi.org/10.57967/hf/2345) 
+- [2024/05/23] the first version of the dataset was uploaded to Hugging Face. [https://huggingface.co/datasets/dariakern/Chicks4FreeID](https://huggingface.co/datasets/dariakern/Chicks4FreeID)
 
 ## 📝 Papers and systems citing the Chicks4FreeID dataset
 coming soon ...
@@ -53,6 +76,7 @@ coming soon ...
       title={Chicks4freeID: A Benchmark Dataset for Chicken Re-Identification}, 
       author={Daria Kern and Tobias Schiele and Ulrich Klauck and Anjali DeSilva and Winfred Ingabire},
       year={2024},
+      doi={https://doi.org/10.57967/hf/2345},
       note={in preparation for NeurIPS 2024 Datasets and Benchmarks Track}
 }
 ```
