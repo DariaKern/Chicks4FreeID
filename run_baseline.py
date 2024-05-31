@@ -1,12 +1,31 @@
+###
+# Author: Tobias
+# Description: This file contains the code for the baseline models used in the experiments
+# of the paper "Chicks4FreeID"
+# The code is based on the lightly benchmarks, but heavily modified
+# Notable changes:
+# - The code is refactored to be used in a single file
+# - The mean average precision metric is added
+# - Support for unsupervised frozen feature extractor methods like MegaDescriptorL384 is added
+# - Support for fully supervised methods like ResNet50Classifier or ViT is added
+# - All methods use the Chicks4FreeID dataset with the same train/val split and input size
+# - All evaluation augmentations are the same
+# - Added a Config class to manage hyperparameters
+# - The code is refactored to use inheritance and composition where possible
+# - The code is refactored to use the PyTorch Lightning implemenations for mAP and top-k accuracy
+# - The end result is a markdown table to compare to the results of the paper
+# - Code that is mostly taken from lightly is marked with a comment
+# Today's Date: 2024-MAY-31
+
 import argparse
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, Union
 
+# General torch imports
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -18,44 +37,55 @@ from torch.nn import (
     Linear,
     Module,
     ModuleList,
+    MSELoss
 )
 from torch.optim import SGD, Optimizer, AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau 
 from torch.utils.data import DataLoader
 
+# For writing the result table to markdown
+import pandas as pd
+
+# For fully supervised baselines
 from torchvision.models import resnet50, vit_b_16, ViT_B_16_Weights
 from torchvision.models.vision_transformer import VisionTransformer
 
+# For calculating the metrics
 from torchmetrics.classification import MulticlassAveragePrecision, MulticlassAccuracy
 
+# To load the Chicks4FreeID dataset
 from datasets import Dataset, load_dataset
+
+# For the training loop
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import DeviceStatsMonitor, Callback
 from pytorch_lightning.loggers import TensorBoardLogger
 
+# For self-supervised baselines and evaluation of the models
 from lightly.data import LightlyDataset
 from lightly.loss.swav_loss import SwaVLoss
 from lightly.models.modules import (
     SwaVProjectionHead,
     SwaVPrototypes,
+    AIMPredictionHead,
+    MaskedCausalVisionTransformer
 )
-from lightly.models.modules.memory_bank import MemoryBankModule
-from lightly.models.utils import get_weight_decay_parameters
-from lightly.transforms import SwaVTransform
-from lightly.utils.benchmarking import (
-    OnlineLinearClassifier,
-)
+from lightly.transforms import SwaVTransform, AIMTransform
 from lightly.utils.dist import print_rank_zero
 from lightly.utils.lars import LARS
 from lightly.utils.scheduler import CosineWarmupScheduler
+from lightly.models import utils
+from lightly.models.utils import random_prefix_mask
+from lightly.models.utils import get_weight_decay_parameters
+from lightly.models.modules.memory_bank import MemoryBankModule
 
+# For loading the state of the art re-id model MegaDescriptorL384
 import timm
 
 
 @dataclass
 class Config:
     batch_size_per_device: int = 16
-    epochs: int = 1000
+    epochs: int = 10
     num_workers: int = 4
     log_dir: Path = Path("baseline_logs")
     checkpoint_path: Optional[Path] = None
@@ -67,7 +97,7 @@ class Config:
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = True
+    test_run: bool = False
     check_val_every_n_epoch: int = 5
     profile= None  # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
@@ -580,13 +610,165 @@ class OnlineLinearClassifier(LinearClassifier):
         )
     
     def forward(self, x: Tensor) -> Tensor:
-        return self.classification_head(x.detach().flatten(start_dim=1))
+        #with torch.no_grad():
+        return self.classification_head(x.flatten(start_dim=1))
 
     def configure_optimizers(self) -> Tuple[List[Optimizer] | List[Dict[str, Any | str]]]:
         # No optimization is performed in this class.
         return None
 
-   
+
+class AIM(MetricModule):
+    def __init__(
+        self, 
+        batch_size_per_device: int, 
+        num_classes: int, 
+        feature_dim: int
+    ) -> None:
+        super().__init__(
+            num_classes=num_classes
+        )
+        self.save_hyperparameters()
+        self.feature_dim = feature_dim
+        self.batch_size_per_device = batch_size_per_device
+
+        vit = MaskedCausalVisionTransformer(
+            img_size=384,
+            patch_size=16,
+            num_classes=num_classes,
+            embed_dim=self.feature_dim,
+            depth=12,
+            num_heads=12,
+            qk_norm=False,
+            class_token=False,
+            no_embed_class=True,
+        )
+        utils.initialize_2d_sine_cosine_positional_embedding(
+            pos_embedding=vit.pos_embed, has_class_token=vit.has_class_token
+        )
+        self.patch_size = vit.patch_embed.patch_size[0]
+        self.num_patches = vit.patch_embed.num_patches
+
+        self.backbone = vit
+        self.projection_head = AIMPredictionHead(
+            input_dim=vit.embed_dim, output_dim=3 * self.patch_size**2
+        )
+
+        self.criterion = MSELoss()
+
+        self.online_classifier = OnlineLinearClassifier(
+            feature_dim=vit.embed_dim, num_classes=num_classes
+        )
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        features = self.backbone.forward_features(x, mask=mask)
+        # TODO: We use mean aggregation for simplicity. The paper uses
+        # AttentionPoolingClassifier to get the class features. But this is not great
+        # as it requires training an additional head.
+        # https://github.com/apple/ml-aim/blob/1eaedecc4d584f2eb7c6921212d86a3a694442e1/aim/torch/layers.py#L337
+        return features.mean(dim=1).flatten(start_dim=1)
+
+    def training_step(
+        self, batch: Tuple[List[Tensor], Tensor, List[str]], batch_idx: int
+    ) -> Tensor:
+        views, targets = batch[0], batch[1]
+        images = views[0]  # AIM has only a single view
+        batch_size = images.shape[0]
+
+        mask = random_prefix_mask(
+            size=(batch_size, self.num_patches),
+            max_prefix_length=self.num_patches - 1,
+            device=images.device,
+        )
+        features = self.backbone.forward_features(images, mask=mask)
+        # Add positional embedding before head.
+        features = self.backbone._pos_embed(features)
+        predictions = self.projection_head(features)
+
+        # Convert images to patches and normalize them.
+        patches = utils.patchify(images, self.patch_size)
+        patches = utils.normalize_mean_var(patches, dim=-1)
+
+        loss = self.criterion(predictions, patches)
+
+        self.log(
+            "train_loss", loss, prog_bar=True, sync_dist=True, batch_size=len(targets)
+        )
+
+        # TODO: We could use AttentionPoolingClassifier instead of mean aggregation:
+        # https://github.com/apple/ml-aim/blob/1eaedecc4d584f2eb7c6921212d86a3a694442e1/aim/torch/layers.py#L337
+        cls_features = features.mean(dim=1).flatten(start_dim=1)
+        # Calculate the classification loss.
+        # with torch.no_grad():
+        cls_scores = self.online_classifier.forward(cls_features.detach())
+        cls_loss = self.online_classifier.criterion(cls_scores, targets)
+        self.log("train_cls_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
+        
+        self.update_train_metrics(cls_scores, targets)
+
+        del views, targets, images, mask, features, predictions, patches, cls_features, cls_scores, batch
+
+        return loss + cls_loss
+
+    @torch.no_grad()
+    def validation_step(
+        self, batch: Tuple[Tensor, Tensor, List[str]], batch_idx: int
+    ) -> Tensor:
+        images, targets = batch[0], batch[1]
+        cls_features = self.forward(images).flatten(start_dim=1)
+        cls_scores = self.online_classifier.forward(cls_features)
+        cls_loss = self.online_classifier.criterion(cls_scores, targets)
+        
+        self.log("val_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
+        self.update_val_metrics(cls_scores, targets)
+
+        del images, targets, cls_features, cls_scores, cls_loss
+
+    def configure_optimizers(self):
+        # Don't use weight decay for batch norm, bias parameters, and classification
+        # head to improve performance.
+        params, params_no_weight_decay = utils.get_weight_decay_parameters(
+            [self.backbone, self.projection_head]
+        )
+        optimizer = AdamW(
+            [
+                {"name": "aim", "params": params},
+                {
+                    "name": "aim_no_weight_decay",
+                    "params": params_no_weight_decay,
+                    "weight_decay": 0.0,
+                },
+                {
+                    "name": "online_classifier",
+                    "params": self.online_classifier.parameters(),
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=0.001 * self.batch_size_per_device * self.trainer.world_size / 4096,
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+        )
+        scheduler = {
+            "scheduler": CosineWarmupScheduler(
+                optimizer=optimizer,
+                warmup_epochs=31250 / 125000 * self.trainer.estimated_stepping_batches,
+                max_epochs=self.trainer.estimated_stepping_batches,
+            ),
+            "interval": "step",
+        }
+        return [optimizer], [scheduler]
+
+    def configure_gradient_clipping(
+        self,
+        optimizer: Optimizer,
+        gradient_clip_val: Union[int, float, None] = None,
+        gradient_clip_algorithm: Union[str, None] = None,
+    ) -> None:
+        self.clip_gradients(
+            optimizer=optimizer, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
+        )
+
+
 
 class SwAV(MetricModule):
     """
@@ -1355,13 +1537,33 @@ class SwAVBaseline(BaselineMethod):
             transform=self.embedding_train_transform,
         ) 
 
-    
+
+class AIMBaseline(BaselineMethod):
+    feature_dim: int = 768    
+    method_specific_augmentation = AIMTransform(
+        input_size=384
+    )
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.model = AIM(
+            batch_size_per_device=self.cfg.batch_size_per_device,
+            num_classes=self.cfg.num_classes,
+            feature_dim=self.feature_dim,
+        )
+
+        self.embedding_train_dataset = LightlyDataset.from_torch_dataset(
+            ChicksVisionDataset(train=True),
+            transform=self.embedding_train_transform,
+        )
+
 
 
 
 class Baseline:
     methods: Dict[str, Type[BaselineMethod]] = {
-        "swav": SwAVBaseline,
+        #"swav": SwAVBaseline,
+        "aim": AIMBaseline,
         "vit_b_16": ViT_B_16Baseline,
         #"resnet50": ResNet50Baseline,
         "mega_descriptor": MegaDescriptorL384Baseline,
