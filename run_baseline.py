@@ -22,12 +22,15 @@ from torch.nn import (
 from torch.optim import SGD, Optimizer, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau 
 from torch.utils.data import DataLoader
-from torchvision.models import resnet50
-from torchmetrics.classification import MulticlassAveragePrecision
+
+from torchvision.models import resnet50, vit_b_16, ViT_B_16_Weights
+from torchvision.models.vision_transformer import VisionTransformer
+
+from torchmetrics.classification import MulticlassAveragePrecision, MulticlassAccuracy
 
 from datasets import Dataset, load_dataset
 from pytorch_lightning import LightningModule, Trainer
-from pytorch_lightning.callbacks import DeviceStatsMonitor
+from pytorch_lightning.callbacks import DeviceStatsMonitor, Callback
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from lightly.data import LightlyDataset
@@ -39,9 +42,7 @@ from lightly.models.modules import (
 from lightly.models.modules.memory_bank import MemoryBankModule
 from lightly.models.utils import get_weight_decay_parameters
 from lightly.transforms import SwaVTransform
-from lightly.utils.benchmarking.topk import mean_topk_accuracy
 from lightly.utils.benchmarking import (
-    MetricCallback,
     OnlineLinearClassifier,
 )
 from lightly.utils.dist import print_rank_zero
@@ -66,7 +67,7 @@ class Config:
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = False
+    test_run: bool = True
     check_val_every_n_epoch: int = 5
     profile= None  # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
@@ -104,7 +105,7 @@ def knn_predict(
     knn_t: float = 0.1,
 ) -> Tensor:
     """
-    [Modified version from lightly, which also returns the scores.]
+    [Modified version from lightly, which returns the scores. instead of the predictions]
 
     Run kNN predictions on features based on a feature bank
 
@@ -132,7 +133,7 @@ def knn_predict(
             Temperature parameter to reweights similarities for kNN.
 
     Returns:
-        A tensor containing the kNN predictions
+        A tensor containing the kNN scores
 
     Examples:
         >>> images, targets, _ = batch
@@ -170,11 +171,89 @@ def knn_predict(
         * sim_weight.unsqueeze(dim=-1),
         dim=1,
     )
-    pred_labels = pred_scores.argsort(dim=-1, descending=True)
-    return pred_labels, pred_scores
+    # pred_labels = pred_scores.argsort(dim=-1, descending=True)
+    return pred_scores
 
 
-class KNNClassifier(LightningModule):
+class MetricCallback(Callback):
+    """Callback that collects log metrics from the LightningModule and stores them after
+    every epoch.
+
+    Attributes:
+        train_metrics:
+            Dictionary that stores the last logged metrics after every train epoch.
+        val_metrics:
+            Dictionary that stores the last logged metrics after every validation epoch.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.train_metrics: Dict[str, List[float]] = {}
+        self.val_metrics: Dict[str, List[float]] = {}
+
+    def on_train_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        if not trainer.sanity_checking:
+            self._append_metrics(metrics_dict=self.train_metrics, trainer=trainer)
+
+    def on_validation_end(
+        self, trainer: Trainer, pl_module: LightningModule
+    ) -> None:
+        if not trainer.sanity_checking:
+            self._append_metrics(metrics_dict=self.val_metrics, trainer=trainer)
+
+    def _append_metrics(
+        self, metrics_dict: Dict[str, List[float]], trainer: Trainer
+    ) -> None:
+        for name, value in trainer.callback_metrics.items():
+            if isinstance(value, Tensor) and value.numel() != 1:
+                # Skip non-scalar tensors.
+                print("skipping metric", name, value)
+                continue
+            metrics_dict.setdefault(name, []).append(float(value))
+
+
+
+class MetricModule(LightningModule):
+    enable_logging = True
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.num_classes = num_classes
+        self.train_map = MulticlassAveragePrecision(num_classes=num_classes)
+        self.val_map = MulticlassAveragePrecision(num_classes=num_classes)
+
+        self.train_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1)
+        self.train_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5)
+
+        self.val_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1)
+        self.val_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5)
+
+    def update_train_metrics(self, pred_scores: Tensor, targets: Tensor):
+        self.train_map(pred_scores, targets)
+        self.train_top1(pred_scores, targets)
+        self.train_top5(pred_scores, targets)
+
+    def update_val_metrics(self, pred_scores: Tensor, targets: Tensor):
+        self.val_map(pred_scores, targets)
+        self.val_top1(pred_scores, targets)
+        self.val_top5(pred_scores, targets)
+
+    def on_train_epoch_end(self):
+        super().on_train_epoch_end()
+        if self.train_map.update_called and self.enable_logging:
+            self.log("train_mAP", self.train_map, prog_bar=True)
+            self.log("train_top1", self.train_top1, prog_bar=True)
+            self.log("train_top5", self.train_top5, prog_bar=True)
+
+    def on_validation_epoch_end(self):
+        super().on_validation_epoch_end()
+        if self.val_map.update_called and self.enable_logging:
+            self.log("val_mAP", self.val_map, prog_bar=True)
+            self.log("val_top1", self.val_top1, prog_bar=True)
+            self.log("val_top5", self.val_top5, prog_bar=True)
+
+
+class KNNClassifier(MetricModule):
     """
     A lightly KNN Classifier modified to log mean average precision metric.
     """
@@ -184,7 +263,6 @@ class KNNClassifier(LightningModule):
         num_classes: int,
         knn_k: int = 200,
         knn_t: float = 0.1,
-        topk: Tuple[int, ...] = (1, 5),
         feature_dtype: torch.dtype = torch.float32,
         normalize: bool = True,
     ):
@@ -205,8 +283,6 @@ class KNNClassifier(LightningModule):
                 Number of neighbors used for KNN search.
             knn_t:
                 Temperature parameter to reweights similarities.
-            topk:
-                Tuple of integers defining the top-k accuracy metrics to compute.
             feature_dtype:
                 Torch data type of the features used for KNN search. Reduce to float16
                 for memory-efficient KNN search.
@@ -244,13 +320,12 @@ class KNNClassifier(LightningModule):
             >>> trainer.fit(knn_classifier, train_dataloder, val_dataloader)
 
         """
-        super().__init__()
+        super().__init__(num_classes=num_classes)
         self.save_hyperparameters(
             {
                 "num_classes": num_classes,
                 "knn_k": knn_k,
                 "knn_t": knn_t,
-                "topk": topk,
                 "feature_dtype": str(feature_dtype),
             }
         )
@@ -259,7 +334,6 @@ class KNNClassifier(LightningModule):
         self.num_classes = num_classes
         self.knn_k = knn_k
         self.knn_t = knn_t
-        self.topk = topk
         self.feature_dtype = feature_dtype
         self.normalize = normalize
 
@@ -267,9 +341,6 @@ class KNNClassifier(LightningModule):
         self._train_targets = []
         self._train_features_tensor: Optional[Tensor] = None
         self._train_targets_tensor: Optional[Tensor] = None
-
-        # Initialize metric for mean average precision.
-        self.map_metric = MulticlassAveragePrecision(num_classes=num_classes)
 
     @torch.no_grad()
     def training_step(self, batch, batch_idx) -> None:
@@ -291,7 +362,7 @@ class KNNClassifier(LightningModule):
         if self.normalize:
             features = F.normalize(features, dim=1)
         features = features.to(self.feature_dtype)
-        predicted_classes, pred_scores = knn_predict(
+        pred_scores = knn_predict(
             feature=features,
             feature_bank=self._train_features_tensor,
             feature_labels=self._train_targets_tensor,
@@ -299,15 +370,9 @@ class KNNClassifier(LightningModule):
             knn_k=self.knn_k,
             knn_t=self.knn_t,
         )
-        topk = mean_topk_accuracy(
-            predicted_classes=predicted_classes, targets=targets, k=self.topk
-        )
-        self.map_metric(pred_scores, targets)
-        log_dict = {f"val_top{k}": acc for k, acc in topk.items()}
-        log_dict["val_mAP"] = self.map_metric.compute()
-        self.log_dict(log_dict, prog_bar=True, sync_dist=True, batch_size=len(targets))
 
-        del images, targets, features, predicted_classes, pred_scores, topk, log_dict
+        self.update_val_metrics(pred_scores, targets)
+        del images, targets, features, pred_scores
 
     def on_validation_epoch_start(self) -> None:
         if self._train_features and self._train_targets:
@@ -349,18 +414,19 @@ class KNNClassifier(LightningModule):
         del self._train_targets
 
 
-class LinearClassifier(LightningModule):
+class LinearClassifier(MetricModule):
     """
     A lightly Linear Classifier, modified to log the mean average precision
     """
+
     def __init__(
         self,
         model: Module,
         batch_size_per_device: int,
-        feature_dim: int = 2048,
-        num_classes: int = 1000,
-        topk: Tuple[int, ...] = (1, 5),
+        feature_dim: int,
+        num_classes: int,
         freeze_model: bool = False,
+        enable_logging: bool = True,
     ) -> None:
         """Linear classifier for computing baseline performance.
 
@@ -378,8 +444,6 @@ class LinearClassifier(LightningModule):
                 Dimension of features returned by forward method of model.
             num_classes:
                 Number of classes in the dataset.
-            topk:
-                Tuple of integers defining the top-k accuracy metrics to compute.
             freeze_model:
                 If True, the model is frozen and only the classification head is
                 trained. This corresponds to the linear eval setting. Set to False for
@@ -421,21 +485,19 @@ class LinearClassifier(LightningModule):
             >>> trainer.fit(linear_classifier, train_dataloader, val_dataloader)
 
         """
-        super().__init__()
+        super().__init__(num_classes=num_classes)
         self.save_hyperparameters(ignore="model")
 
         self.model = model
         self.batch_size_per_device = batch_size_per_device
         self.feature_dim = feature_dim
         self.num_classes = num_classes
-        self.topk = topk
         self.freeze_model = freeze_model
+        self.enable_logging = enable_logging
 
         self.classification_head = Linear(feature_dim, num_classes)
         self.criterion = CrossEntropyLoss()
 
-        # Initialize metric for mean average precision.
-        self.map_metric = MulticlassAveragePrecision(num_classes=num_classes)
     
     def forward(self, images: Tensor) -> Tensor:
         with torch.set_grad_enabled(not self.freeze_model):
@@ -444,51 +506,32 @@ class LinearClassifier(LightningModule):
         del images, features
         return output
 
-    
-    def shared_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tuple[Tensor, Dict[int, Tensor]]:
+
+    def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
         images, targets = batch[0], batch[1]
         predictions = self.forward(images)
         loss = self.criterion(predictions, targets)
-        _, predicted_labels = predictions.topk(max(self.topk), dim=1)
-        topk = mean_topk_accuracy(predicted_labels.detach().cpu(), targets.detach().cpu(), k=self.topk)
-        self.map_metric.update(predictions.detach().cpu(), targets.detach().cpu())
 
-        del images, targets, predictions, predicted_labels
-        return loss, topk
-
-
-    def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
-        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
-        batch_size = batch[0].size(0)
-
-        # Detach the tensors you need to log but not to track gradients
-        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
-
-        self.log("train_loss", loss, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        self.log_dict({f"train_top{k}": acc for k, acc in detached_topk.items()}, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        self.log("train_mAP", self.map_metric.compute().detach().cpu(), prog_bar=True, sync_dist=True, batch_size=batch_size)
+        if self.enable_logging:
+            self.log("train_loss", loss, prog_bar=True, sync_dist=True, batch_size=images.size(0))
+            self.update_train_metrics(predictions, targets)
 
         # Clear unnecessary variables
-        del batch, topk, detached_topk
+        del batch, images, targets, predictions
+        return loss  # Return the loss
 
-        return loss  # Return the loss before deleting it
-
-    
+    @torch.no_grad()
     def validation_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
-        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
-        batch_size = len(batch[1])
-
-        # Detach the tensors you need to log but not to track gradients
-        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
-
-        self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        self.log_dict({f"val_top{k}": acc for k, acc in detached_topk.items()}, prog_bar=True, sync_dist=True, batch_size=batch_size)
-        self.log("val_mAP", self.map_metric.compute().detach().cpu(), prog_bar=True, sync_dist=True, batch_size=batch_size)
+        images, targets = batch[0], batch[1]
+        predictions = self.forward(images)
+        loss = self.criterion(predictions, targets)
+        if self.enable_logging:
+            self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=images.size(0))
+            self.update_val_metrics(predictions, targets)
 
         # Clear unnecessary variables
-        del batch, topk, detached_topk
+        del batch, images, targets, predictions, loss
 
-        return loss  # Return the loss before deleting it
 
     def configure_optimizers(
         self,
@@ -518,28 +561,23 @@ class LinearClassifier(LightningModule):
             self.model.eval()
 
 
-class OnlineLinearClassifier(LightningModule):
+class OnlineLinearClassifier(LinearClassifier):
     """
     A lightly Online Linear Classifier, modified to log the mean average precision
     """
     def __init__(
         self,
-        feature_dim: int = 2048,
-        num_classes: int = 1000,
-        topk: Tuple[int, ...] = (1, 5),
-        dtype: torch.dtype = torch.float32,
+        feature_dim,
+        num_classes,
+        enable_logging: bool = True
     ) -> None:
-        super().__init__()
-        self.save_hyperparameters(ignore="model")
-        self.feature_dim=feature_dim,
-        self.num_classes=num_classes,
-        self.topk=topk
-
-        self.classification_head = Linear(feature_dim, num_classes, dtype=dtype)
-        self.criterion = CrossEntropyLoss()
-
-        # Initialize metric for mean average precision.
-        self.map_metric = MulticlassAveragePrecision(num_classes=num_classes)
+        super().__init__(
+            model=None,  # Not used for online classifier
+            batch_size_per_device=None, # Not used for online classifier
+            feature_dim=feature_dim,
+            num_classes=num_classes,
+            enable_logging=enable_logging
+        )
     
     def forward(self, x: Tensor) -> Tensor:
         return self.classification_head(x.detach().flatten(start_dim=1))
@@ -548,58 +586,23 @@ class OnlineLinearClassifier(LightningModule):
         # No optimization is performed in this class.
         return None
 
-    def shared_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tuple[Tensor, Dict[int, Tensor]]:
-        images, targets = batch[0], batch[1]
-        predictions = self.forward(images)
-        loss = self.criterion(predictions, targets)
-        _, predicted_labels = predictions.topk(max(self.topk), dim=1)
-        topk = mean_topk_accuracy(predicted_labels.detach().cpu(), targets.detach().cpu(), k=self.topk)
-        self.map_metric.update(predictions.detach().cpu(), targets.detach().cpu())
+   
 
-        del images, targets, predictions, predicted_labels
-        return loss, topk
-
-
-    def training_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
-        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
-        
-        # Detach the tensors you need to log but not to track gradients
-        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
-
-        log_dict = {f"train_top{k}": acc for k, acc in detached_topk.items()}
-        log_dict["train_mAP"] = self.map_metric.compute().detach().cpu()
-        log_dict["train_loss"] = loss
-
-        # Clear unnecessary variables
-        del batch, topk, detached_topk
-
-        return loss, log_dict  # Return the loss before deleting it
-
-    
-    def validation_step(self, batch: Tuple[Tensor, ...], batch_idx: int) -> Tensor:
-        loss, topk = self.shared_step(batch=batch, batch_idx=batch_idx)
-        
-        # Detach the tensors you need to log but not to track gradients
-        detached_topk = {k: v.detach().cpu() for k, v in topk.items()}
-
-        log_dict = {f"val_top{k}": acc for k, acc in detached_topk.items()}
-        log_dict["val_mAP"] = self.map_metric.compute().detach().cpu()
-        log_dict["val_loss"] = loss
-
-        # Clear unnecessary variables
-        del batch, topk, detached_topk
-
-        return loss, log_dict  # Return the loss before deleting it
-
-
-class SwAV(LightningModule):
+class SwAV(MetricModule):
     """
     A lightly SwAV model, modified to log the mean average precision
     """
     CROP_COUNTS: Tuple[int, int] = (2, 6)
 
-    def __init__(self, batch_size_per_device: int, num_classes: int) -> None:
-        super().__init__()
+    def __init__(
+        self, 
+        batch_size_per_device: int, 
+        num_classes: int, 
+        feature_dim: int
+    ) -> None:
+        super().__init__(
+            num_classes=num_classes
+        )
         self.save_hyperparameters()
         self.batch_size_per_device = batch_size_per_device
 
@@ -609,7 +612,11 @@ class SwAV(LightningModule):
         self.projection_head = SwaVProjectionHead()
         self.prototypes = SwaVPrototypes(n_steps_frozen_prototypes=1)
         self.criterion = SwaVLoss(sinkhorn_gather_distributed=True)
-        self.online_classifier = OnlineLinearClassifier(num_classes=num_classes)
+        self.online_classifier = OnlineLinearClassifier(
+            feature_dim=feature_dim,
+            num_classes=num_classes,
+            enable_logging=False
+        )
 
         # Use a queue for small batch sizes (<= 256).
         self.start_queue_at_epoch = 15
@@ -622,9 +629,6 @@ class SwAV(LightningModule):
                 for _ in range(SwAV.CROP_COUNTS[0])
             ]
         )
-
-        # Initialize metric for mean average precision.
-        self.map_metric = MulticlassAveragePrecision(num_classes=num_classes)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.backbone(x)
@@ -680,36 +684,33 @@ class SwAV(LightningModule):
             low_resolution_outputs=multi_crop_logits[SwAV.CROP_COUNTS[0] :],
             queue_outputs=queue_crop_logits,
         )
-        self.log(
-            "train_loss",
-            loss,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=len(targets),
-        )
+        self.log("train_loss",loss,prog_bar=True,sync_dist=True,batch_size=len(targets))
 
         # Calculate the classification loss.
-        cls_loss, cls_log = self.online_classifier.training_step(
-            (multi_crop_features[0].detach(), targets), batch_idx
-        )
-        self.log_dict(cls_log, prog_bar=True, sync_dist=True, batch_size=len(targets))
+        with torch.no_grad():
+            cls_scores = self.online_classifier.forward(multi_crop_features[0].detach())
+            cls_loss = self.online_classifier.criterion(cls_scores, targets)
+            self.log("train_cls_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
         
-        del multi_crops, targets, multi_crop_features, multi_crop_projections, queue_crop_logits, multi_crop_logits, cls_log
+        self.update_train_metrics(cls_scores, targets)
+
+        del multi_crops, targets, multi_crop_features, multi_crop_projections, queue_crop_logits, multi_crop_logits
         return loss + cls_loss
 
+    @torch.no_grad()
     def validation_step(
         self, batch: Tuple[Tensor, Tensor, List[str]], batch_idx: int
     ) -> Tensor:
         images, targets = batch[0], batch[1]
-        with torch.no_grad():
-            features = self.forward(images).flatten(start_dim=1)
-        cls_loss, cls_log = self.online_classifier.validation_step(
-            (features.detach(), targets), batch_idx
-        )
-        self.log_dict(cls_log, prog_bar=True, sync_dist=True, batch_size=len(targets))
+        features = self.forward(images).flatten(start_dim=1)
+        cls_scores = self.online_classifier.forward(features)
+        cls_loss = self.online_classifier.criterion(cls_scores, targets)
+        
+        self.log("val_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
+        self.update_val_metrics(cls_scores, targets)
 
-        del images, targets, features, cls_log
-        return cls_loss
+        del images, targets, features, cls_scores, cls_loss
+        
 
     def configure_optimizers(self):
         # Don't use weight decay for batch norm, bias parameters, and classification
@@ -739,12 +740,7 @@ class SwAV(LightningModule):
             weight_decay=1e-6,
         )
         print_rank_zero(f"Estimated steps: {self.trainer.estimated_stepping_batches}")
-        warump_steps = int(
-            min(
-                self.trainer.estimated_stepping_batches / 10,
-                self.trainer.estimated_stepping_batches / self.trainer.max_epochs * 10,
-            )
-        )
+        warump_steps = int(self.trainer.estimated_stepping_batches / self.trainer.max_epochs * 10)
         print_rank_zero(f"Warmup steps: {warump_steps}")
         max_steps = self.trainer.estimated_stepping_batches
         print_rank_zero(f"Max steps: {max_steps}")
@@ -798,9 +794,8 @@ class ResNet50Classifier(LinearClassifier):
     def __init__(
         self,
         batch_size_per_device: int,
-        feature_dim: int = 2048,
-        num_classes: int = 1000,
-        topk: Tuple[int, ...] = (1, 5),
+        feature_dim,
+        num_classes,
         freeze_model: bool = False,
     ) -> None:
         super().__init__(
@@ -808,7 +803,6 @@ class ResNet50Classifier(LinearClassifier):
             feature_dim=feature_dim,
             num_classes=num_classes,
             batch_size_per_device=batch_size_per_device,
-            topk=topk,
             freeze_model=freeze_model,
         )
         
@@ -817,32 +811,6 @@ class ResNet50Classifier(LinearClassifier):
         self.model.fc = Identity()
         self.classification_head = fc
 
-    def configure_optimizers(
-        self,
-    ) -> Tuple[List[Optimizer], List[Dict[str, Union[Any, str]]]]:
-        parameters = list(self.classification_head.parameters())
-        if not self.freeze_model:
-            parameters += self.model.parameters()
-        # SGD with momentum and weight decay.
-        optimizer = SGD(
-            parameters,
-            lr=1, # Start with high learning rate, because we have RedLRonPlateau
-            momentum=0.9,
-            weight_decay=1e-2,
-        )
-        # Reduce Learning Rate on Plateau
-        scheduler = {
-            "scheduler": ReduceLROnPlateau(
-                optimizer=optimizer,
-                mode="min",
-                factor=0.5,
-                patience=5,
-                verbose=True,
-            ),
-            "interval": "epoch",
-            "monitor": "train_loss",
-        }
-        return [optimizer], [scheduler]
 
 class ResNetEmbedding(LightningModule):
     """
@@ -866,6 +834,76 @@ class ResNetEmbedding(LightningModule):
         # configure_optimizers must be implemented for PyTorch Lightning. Returning None
         # means that no optimization is performed.
         pass
+
+
+
+class ViT_B_16Classifier(LinearClassifier):
+    model: VisionTransformer
+    def __init__(
+        self,
+        batch_size_per_device,
+        feature_dim,
+        num_classes,
+    ) -> None:
+        super().__init__(
+            model=None,
+            feature_dim=feature_dim,
+            num_classes=num_classes,
+            batch_size_per_device=batch_size_per_device,
+            freeze_model=False,
+        )
+
+        self.model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1)
+        self.model.heads = Identity()
+        
+
+    def configure_optimizers(self):
+        # Don't use weight decay for batch norm, bias parameters, and classification
+        # head to improve performance.
+        params, params_no_weight_decay = get_weight_decay_parameters(
+            [self.model]#, self.classification_head]
+        )
+        optimizer = AdamW(
+            [
+                {"name": "mae", "params": params},
+                {
+                    "name": "vit_no_weight_decay",
+                    "params": params_no_weight_decay,
+                    "weight_decay": 0.0,
+                },
+                {
+                    "name": "classhead_classifier",
+                    "params": self.classification_head.parameters(),
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=0.001 * self.batch_size_per_device * self.trainer.world_size / 4096,
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+        )
+        scheduler = {
+            "scheduler": CosineWarmupScheduler(
+                optimizer=optimizer,
+                warmup_epochs=31250 / 125000 * self.trainer.estimated_stepping_batches,
+                max_epochs=self.trainer.estimated_stepping_batches,
+            ),
+            "interval": "step",
+        }
+        return [optimizer], [scheduler]
+
+
+class ViTEmbedding(LightningModule):
+
+    def __init__(self, model: ViT_B_16Classifier) -> None:
+        super().__init__()
+        self.save_hyperparameters(ignore="model")
+        self.model = model.model
+        self.model.eval()
+
+    def forward(self, x: Tensor) -> Tensor:
+        with torch.no_grad():
+            return self.model(x)
+
 
 
 class MegaDescriptorL384(LightningModule):
@@ -1245,14 +1283,14 @@ class ResNet50Baseline(BaselineMethod):
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
+    feature_dim: int = 2048
     
     def __init__(self, args):
         super().__init__(args)
-
         self.model = ResNet50Classifier(
             batch_size_per_device=self.cfg.batch_size_per_device,
             num_classes=self.cfg.num_classes,
-            topk=(1, 5),
+            feature_dim=self.feature_dim,
             freeze_model=False,
         )
 
@@ -1263,150 +1301,28 @@ class ResNet50Baseline(BaselineMethod):
     
 class MegaDescriptorL384Baseline(BaselineMethod):
     normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-
+    skip_embedding_training = True
+    feature_dim = 1536        
+        
     def __init__(self, args):
         super().__init__(args)
-
         self.model = MegaDescriptorL384()
-        self.skip_embedding_training = True
-        self.feature_dim = 1536
 
 
-from torchvision.models.vision_transformer import VisionTransformer
-
-
-class ViT_L_16Classifier(LinearClassifier):
-    model: VisionTransformer
-    def __init__(
-        self,
-        batch_size_per_device,
-        num_classes,
-        topk=(1, 5),
-        freeze_model=False,
-    ) -> None:
-        super().__init__(
-            model=None,
-            feature_dim=768,
-            num_classes=num_classes,
-            batch_size_per_device=batch_size_per_device,
-            topk=topk,
-            freeze_model=False,
-        )
-
-        from torchvision.models import vit_b_16, ViT_B_16_Weights
-
-        self.model = vit_b_16(
-            weights=ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1,
-        )
-
-        # self.model = VisionTransformer(
-        #     image_size=384,
-        #     num_classes=num_classes,
-        #     patch_size=16,
-        #     num_layers=24,
-        #     num_heads=16,
-        #     hidden_dim=1024,
-        #     mlp_dim=4096,
-        #     dropout=0.1,
-        # )
-        # head = self.model.heads
-        self.model.heads = Identity()
-        
-
-    def configure_optimizers(self):
-        # Don't use weight decay for batch norm, bias parameters, and classification
-        # head to improve performance.
-        params, params_no_weight_decay = get_weight_decay_parameters(
-            [self.model]#, self.classification_head]
-        )
-        optimizer = AdamW(
-            [
-                {"name": "mae", "params": params},
-                {
-                    "name": "vit_no_weight_decay",
-                    "params": params_no_weight_decay,
-                    "weight_decay": 0.0,
-                },
-                {
-                    "name": "classhead_classifier",
-                    "params": self.classification_head.parameters(),
-                    "weight_decay": 0.0,
-                },
-            ],
-            lr=0.001 * self.batch_size_per_device * self.trainer.world_size / 4096,
-            weight_decay=0.05,
-            betas=(0.9, 0.95),
-        )
-        scheduler = {
-            "scheduler": CosineWarmupScheduler(
-                optimizer=optimizer,
-                warmup_epochs=31250 / 125000 * self.trainer.estimated_stepping_batches,
-                max_epochs=self.trainer.estimated_stepping_batches,
-            ),
-            "interval": "step",
-        }
-        return [optimizer], [scheduler]
-
-    def configure_optimizers_(self):
-        optimizer = AdamW(self.parameters(), lr=1e-4, weight_decay=0.01)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
-        return [optimizer], [scheduler]
-
-    # def configure_optimizers_(
-    #     self,
-    # ) -> Tuple[List[Optimizer], List[Dict[str, Union[Any, str]]]]:
-    #     parameters = list(self.classification_head.parameters())
-    #     if not self.freeze_model:
-    #         parameters += self.model.parameters()
-    #     # SGD with momentum and weight decay.
-    #     optimizer = SGD(
-    #         parameters,
-    #         lr=1, # Start with high learning rate, because we have RedLRonPlateau
-    #         momentum=0.9,
-    #         weight_decay=1e-2,
-    #     )
-    #     # Reduce Learning Rate on Plateau
-    #     scheduler = {
-    #         "scheduler": ReduceLROnPlateau(
-    #             optimizer=optimizer,
-    #             mode="min",
-    #             factor=0.5,
-    #             patience=5,
-    #             verbose=True,
-    #         ),
-    #         "interval": "epoch",
-    #         "monitor": "train_loss",
-    #     }
-    #     return [optimizer], [scheduler]
-
-
-class ViTEmbedding(LightningModule):
-    def __init__(self, model: ViT_L_16Classifier) -> None:
-        super().__init__()
-        self.save_hyperparameters(ignore="model")
-        self.model = model.model
-        self.model.eval()
-
-    def forward(self, x: Tensor) -> Tensor:
-        with torch.no_grad():
-            return self.model(x)
-
-
-
-class ViT_L_16Baseline(BaselineMethod):
+class ViT_B_16Baseline(BaselineMethod):
     method_specific_augmentation = T.Compose([
         T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
+    feature_dim: int = 768
 
-    def __init__(self, args):
-        super().__init__(args)
-
-
-        self.model = ViT_L_16Classifier(
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.model = ViT_B_16Classifier(
             batch_size_per_device=self.cfg.batch_size_per_device,
             num_classes=self.cfg.num_classes,
+            feature_dim=self.feature_dim,
         )
 
     def get_embedding_model(self):
@@ -1421,13 +1337,17 @@ class SwAVBaseline(BaselineMethod):
         gaussian_blur=0.1,
         crop_counts=SwAV.CROP_COUNTS
     )
+    feature_dim: int = 2048
 
     def __init__(self, args):
-        super().__init__(args)
+        super().__init__(
+            args
+        )
 
         self.model = SwAV(
             batch_size_per_device=self.cfg.batch_size_per_device,
             num_classes=self.cfg.num_classes,
+            feature_dim=self.feature_dim,
         )
 
         self.embedding_train_dataset = LightlyDataset.from_torch_dataset(
@@ -1441,9 +1361,9 @@ class SwAVBaseline(BaselineMethod):
 
 class Baseline:
     methods: Dict[str, Type[BaselineMethod]] = {
-        "vit_l_16": ViT_L_16Baseline,
         "swav": SwAVBaseline,
-        "resnet50": ResNet50Baseline,
+        "vit_b_16": ViT_B_16Baseline,
+        #"resnet50": ResNet50Baseline,
         "mega_descriptor": MegaDescriptorL384Baseline,
     }
 
