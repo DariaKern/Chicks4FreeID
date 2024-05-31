@@ -12,3 +12,4 @@ torch==2.3.0
 pandas==2.2.2
 kaleido==0.1.*
 plotly
+psutil

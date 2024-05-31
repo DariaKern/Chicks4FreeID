@@ -19,7 +19,7 @@ from torch.nn import (
     Module,
     ModuleList,
 )
-from torch.optim import SGD, Optimizer
+from torch.optim import SGD, Optimizer, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau 
 from torch.utils.data import DataLoader
 from torchvision.models import resnet50
@@ -53,7 +53,7 @@ import timm
 
 @dataclass
 class Config:
-    batch_size_per_device: int = 128
+    batch_size_per_device: int = 16
     epochs: int = 1000
     num_workers: int = 4
     log_dir: Path = Path("baseline_logs")
@@ -1223,7 +1223,7 @@ class BaselineMethod():
         
         # Update the metric values in a markdown and csv file
         metrics = {
-            metric: value
+            metric: max(value)
             for metric, value in metric_callback.val_metrics.items()
             if "train" not in metric and "loss" not in metric
         }
@@ -1272,6 +1272,148 @@ class MegaDescriptorL384Baseline(BaselineMethod):
         self.feature_dim = 1536
 
 
+from torchvision.models.vision_transformer import VisionTransformer
+
+
+class ViT_L_16Classifier(LinearClassifier):
+    model: VisionTransformer
+    def __init__(
+        self,
+        batch_size_per_device,
+        num_classes,
+        topk=(1, 5),
+        freeze_model=False,
+    ) -> None:
+        super().__init__(
+            model=None,
+            feature_dim=768,
+            num_classes=num_classes,
+            batch_size_per_device=batch_size_per_device,
+            topk=topk,
+            freeze_model=False,
+        )
+
+        from torchvision.models import vit_b_16, ViT_B_16_Weights
+
+        self.model = vit_b_16(
+            weights=ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1,
+        )
+
+        # self.model = VisionTransformer(
+        #     image_size=384,
+        #     num_classes=num_classes,
+        #     patch_size=16,
+        #     num_layers=24,
+        #     num_heads=16,
+        #     hidden_dim=1024,
+        #     mlp_dim=4096,
+        #     dropout=0.1,
+        # )
+        # head = self.model.heads
+        self.model.heads = Identity()
+        
+
+    def configure_optimizers(self):
+        # Don't use weight decay for batch norm, bias parameters, and classification
+        # head to improve performance.
+        params, params_no_weight_decay = get_weight_decay_parameters(
+            [self.model]#, self.classification_head]
+        )
+        optimizer = AdamW(
+            [
+                {"name": "mae", "params": params},
+                {
+                    "name": "vit_no_weight_decay",
+                    "params": params_no_weight_decay,
+                    "weight_decay": 0.0,
+                },
+                {
+                    "name": "classhead_classifier",
+                    "params": self.classification_head.parameters(),
+                    "weight_decay": 0.0,
+                },
+            ],
+            lr=0.001 * self.batch_size_per_device * self.trainer.world_size / 4096,
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+        )
+        scheduler = {
+            "scheduler": CosineWarmupScheduler(
+                optimizer=optimizer,
+                warmup_epochs=31250 / 125000 * self.trainer.estimated_stepping_batches,
+                max_epochs=self.trainer.estimated_stepping_batches,
+            ),
+            "interval": "step",
+        }
+        return [optimizer], [scheduler]
+
+    def configure_optimizers_(self):
+        optimizer = AdamW(self.parameters(), lr=1e-4, weight_decay=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.1)
+        return [optimizer], [scheduler]
+
+    # def configure_optimizers_(
+    #     self,
+    # ) -> Tuple[List[Optimizer], List[Dict[str, Union[Any, str]]]]:
+    #     parameters = list(self.classification_head.parameters())
+    #     if not self.freeze_model:
+    #         parameters += self.model.parameters()
+    #     # SGD with momentum and weight decay.
+    #     optimizer = SGD(
+    #         parameters,
+    #         lr=1, # Start with high learning rate, because we have RedLRonPlateau
+    #         momentum=0.9,
+    #         weight_decay=1e-2,
+    #     )
+    #     # Reduce Learning Rate on Plateau
+    #     scheduler = {
+    #         "scheduler": ReduceLROnPlateau(
+    #             optimizer=optimizer,
+    #             mode="min",
+    #             factor=0.5,
+    #             patience=5,
+    #             verbose=True,
+    #         ),
+    #         "interval": "epoch",
+    #         "monitor": "train_loss",
+    #     }
+    #     return [optimizer], [scheduler]
+
+
+class ViTEmbedding(LightningModule):
+    def __init__(self, model: ViT_L_16Classifier) -> None:
+        super().__init__()
+        self.save_hyperparameters(ignore="model")
+        self.model = model.model
+        self.model.eval()
+
+    def forward(self, x: Tensor) -> Tensor:
+        with torch.no_grad():
+            return self.model(x)
+
+
+
+class ViT_L_16Baseline(BaselineMethod):
+    method_specific_augmentation = T.Compose([
+        T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    def __init__(self, args):
+        super().__init__(args)
+
+
+        self.model = ViT_L_16Classifier(
+            batch_size_per_device=self.cfg.batch_size_per_device,
+            num_classes=self.cfg.num_classes,
+        )
+
+    def get_embedding_model(self):
+        return ViTEmbedding(model=self.model)
+
+
+
 class SwAVBaseline(BaselineMethod):
     method_specific_augmentation = SwaVTransform(
         rr_prob=0.5,
@@ -1294,8 +1436,12 @@ class SwAVBaseline(BaselineMethod):
         ) 
 
     
+
+
+
 class Baseline:
     methods: Dict[str, Type[BaselineMethod]] = {
+        "vit_l_16": ViT_L_16Baseline,
         "swav": SwAVBaseline,
         "resnet50": ResNet50Baseline,
         "mega_descriptor": MegaDescriptorL384Baseline,

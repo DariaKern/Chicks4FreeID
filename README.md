@@ -7,15 +7,15 @@ is available on 🤗 **Hugging Face**: [huggingface.co/datasets/dariakern/Chicks
 
 ## 🤗 Usage
 
-```shell
-pip install datasets
-```
+> ```shell
+> pip install datasets
+> ```
 
-```python
-from datasets import load_dataset
-train_ds = load_dataset("dariakern/Chicks4FreeID", split="train")
-train_ds[0]
-```
+> ```python
+> from datasets import load_dataset
+> train_ds = load_dataset("dariakern/Chicks4FreeID", split="train")
+> train_ds[0]
+> ```
 
 ```python
 {'crop': <PIL.PngImagePlugin.PngImageFile image mode=RGB size=2630x2630 at 0x7AA95E7D1720>,
@@ -24,7 +24,7 @@ train_ds[0]
 
 
 > [!TIP]
-> Find more information on how to work with 🤗 datasets [here]()
+> Find more information on how to work with 🤗  [huggingface.co/docs/datasets](https://huggingface.co/docs/datasets/v2.19.0/index)
 
 
 ## 📊 Baseline
