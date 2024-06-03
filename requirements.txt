@@ -13,3 +13,5 @@ pandas==2.2.2
 kaleido==0.1.*
 plotly
 psutil
+wildlife-tools==0.0.2
+pytorch-metric-learning==2.5.0
