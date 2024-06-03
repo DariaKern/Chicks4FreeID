@@ -18,6 +18,7 @@
 # Today's Date: 2024-MAY-31
 
 import argparse
+from itertools import chain, islice
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -81,11 +82,12 @@ from lightly.models.modules.memory_bank import MemoryBankModule
 # For loading the state of the art re-id model MegaDescriptorL384
 import timm
 
+from wildlife_tools.train.objective import ArcFaceLoss
 
 @dataclass
 class Config:
     batch_size_per_device: int = 16
-    epochs: int = 10
+    epochs: int = 200
     num_workers: int = 4
     log_dir: Path = Path("baseline_logs")
     checkpoint_path: Optional[Path] = None
@@ -249,35 +251,38 @@ class MetricModule(LightningModule):
     def __init__(self, num_classes: int):
         super().__init__()
         self.num_classes = num_classes
-        self.train_map = MulticlassAveragePrecision(num_classes=num_classes)
-        self.val_map = MulticlassAveragePrecision(num_classes=num_classes)
+        if self.enable_logging:
+            self.train_map = MulticlassAveragePrecision(num_classes=num_classes)
+            self.val_map = MulticlassAveragePrecision(num_classes=num_classes)
 
-        self.train_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1)
-        self.train_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5)
+            self.train_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1)
+            self.train_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5)
 
-        self.val_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1)
-        self.val_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5)
+            self.val_top1 = MulticlassAccuracy(num_classes=num_classes, top_k=1)
+            self.val_top5 = MulticlassAccuracy(num_classes=num_classes, top_k=5)
 
     def update_train_metrics(self, pred_scores: Tensor, targets: Tensor):
-        self.train_map(pred_scores, targets)
-        self.train_top1(pred_scores, targets)
-        self.train_top5(pred_scores, targets)
+        if self.enable_logging:
+            self.train_map(pred_scores, targets)
+            self.train_top1(pred_scores, targets)
+            self.train_top5(pred_scores, targets)
 
     def update_val_metrics(self, pred_scores: Tensor, targets: Tensor):
-        self.val_map(pred_scores, targets)
-        self.val_top1(pred_scores, targets)
-        self.val_top5(pred_scores, targets)
+        if self.enable_logging:
+            self.val_map(pred_scores, targets)
+            self.val_top1(pred_scores, targets)
+            self.val_top5(pred_scores, targets)
 
     def on_train_epoch_end(self):
         super().on_train_epoch_end()
-        if self.train_map.update_called and self.enable_logging:
+        if self.enable_logging and self.train_map.update_called:
             self.log("train_mAP", self.train_map, prog_bar=True)
             self.log("train_top1", self.train_top1, prog_bar=True)
             self.log("train_top5", self.train_top5, prog_bar=True)
 
     def on_validation_epoch_end(self):
         super().on_validation_epoch_end()
-        if self.val_map.update_called and self.enable_logging:
+        if self.enable_logging and self.val_map.update_called:
             self.log("val_mAP", self.val_map, prog_bar=True)
             self.log("val_top1", self.val_top1, prog_bar=True)
             self.log("val_top5", self.val_top5, prog_bar=True)
@@ -525,9 +530,16 @@ class LinearClassifier(MetricModule):
         self.freeze_model = freeze_model
         self.enable_logging = enable_logging
 
-        self.classification_head = Linear(feature_dim, num_classes)
-        self.criterion = CrossEntropyLoss()
+        self.classification_head = self.build_classification_head(
+            feature_dim=feature_dim, num_classes=num_classes
+        )
+        self.criterion = self.build_critierion()
 
+    def build_classification_head(self, feature_dim: int, num_classes: int):
+        return Linear(feature_dim, num_classes)
+    
+    def build_critierion(self):
+        return CrossEntropyLoss()
     
     def forward(self, images: Tensor) -> Tensor:
         with torch.set_grad_enabled(not self.freeze_model):
@@ -542,9 +554,9 @@ class LinearClassifier(MetricModule):
         predictions = self.forward(images)
         loss = self.criterion(predictions, targets)
 
-        if self.enable_logging:
-            self.log("train_loss", loss, prog_bar=True, sync_dist=True, batch_size=images.size(0))
-            self.update_train_metrics(predictions, targets)
+        #if self.enable_logging:
+        self.log("train_loss", loss, prog_bar=True, sync_dist=True, batch_size=images.size(0))
+        self.update_train_metrics(predictions, targets)
 
         # Clear unnecessary variables
         del batch, images, targets, predictions
@@ -555,9 +567,9 @@ class LinearClassifier(MetricModule):
         images, targets = batch[0], batch[1]
         predictions = self.forward(images)
         loss = self.criterion(predictions, targets)
-        if self.enable_logging:
-            self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=images.size(0))
-            self.update_val_metrics(predictions, targets)
+        #if self.enable_logging:
+        self.log("val_loss", loss, prog_bar=True, sync_dist=True, batch_size=images.size(0))
+        self.update_val_metrics(predictions, targets)
 
         # Clear unnecessary variables
         del batch, images, targets, predictions, loss
@@ -611,7 +623,7 @@ class OnlineLinearClassifier(LinearClassifier):
     
     def forward(self, x: Tensor) -> Tensor:
         #with torch.no_grad():
-        return self.classification_head(x.flatten(start_dim=1))
+        return self.classification_head(x.detach().flatten(start_dim=1))
 
     def configure_optimizers(self) -> Tuple[List[Optimizer] | List[Dict[str, Any | str]]]:
         # No optimization is performed in this class.
@@ -715,7 +727,10 @@ class AIM(MetricModule):
         self, batch: Tuple[Tensor, Tensor, List[str]], batch_idx: int
     ) -> Tensor:
         images, targets = batch[0], batch[1]
-        cls_features = self.forward(images).flatten(start_dim=1)
+        features = self.backbone.forward_features(images, mask=None)
+        # Add positional embedding before head.
+        features = self.backbone._pos_embed(features)
+        cls_features = features.mean(dim=1).flatten(start_dim=1)
         cls_scores = self.online_classifier.forward(cls_features)
         cls_loss = self.online_classifier.criterion(cls_scores, targets)
         
@@ -1117,6 +1132,55 @@ class MegaDescriptorL384(LightningModule):
         pass
 
 
+
+class MegaDescriptorL384FineTune(LinearClassifier):
+    """
+    A model that uses the MegaDescriptor-L-384 model from the HuggingFace model hub
+    to compute baseline metrics of an fintetuned setting.
+
+    The model is  finetuned on the Chick4FreeID dataset
+
+    The model has been trained on external Animal Re-ID Data + The chicks4FreeID dataset
+    """
+    enable_logging: bool = False
+
+    def __init__(
+        self,
+        batch_size_per_device,
+        feature_dim,
+        num_classes,
+    ) -> None:
+        super().__init__(
+            model=timm.create_model('swin_large_patch4_window12_384', num_classes=0, pretrained=True),
+            feature_dim=feature_dim,
+            num_classes=num_classes,
+            batch_size_per_device=batch_size_per_device,
+            freeze_model=False,
+            enable_logging=self.enable_logging
+        )
+        
+    
+    def build_critierion(self):
+        return ArcFaceLoss(num_classes=self.num_classes, embedding_size=self.feature_dim, margin=0.5, scale=64)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.model(x)
+
+    def configure_optimizers(self):
+        # Combine the parameters of the model and the criterion
+        params = chain(self.model.parameters(), self.criterion.parameters())
+
+        # Define the optimizer with specified learning rate and momentum
+        optimizer = SGD(params=params, lr=0.001, momentum=0.9)
+
+        # Calculate the minimum learning rate
+        min_lr = optimizer.defaults.get("lr") * 1e-3
+
+        # Define the scheduler with a cosine annealing learning rate strategy
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=min_lr)
+
+        return [optimizer], [scheduler]
+
 from PIL import Image
 HF_DATASET_DICT: Dict[str, Dataset] = {}
 TRAIN_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
@@ -1136,12 +1200,14 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         resize: int = 384,
+        test_run: bool = False,
     ) -> None:
         global HF_DATASET_DICT, TRAIN_DATASET_CACHE, TEST_DATASET_CACHE
         super().__init__(root, transform=transform, target_transform=target_transform)
         self.resize = resize
         self.transform = transform
         self.target_transform = target_transform
+        self.test_run = test_run
 
         if not HF_DATASET_DICT:
             HF_DATASET_DICT = load_dataset(
@@ -1152,12 +1218,12 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
         if not TRAIN_DATASET_CACHE:
             print_rank_zero("Caching train images in memory...")
             TRAIN_DATASET_CACHE = [
-                self._load_row(data) for data in tqdm(HF_DATASET_DICT["train"])
+                self._load_row(data) for data in tqdm(self.check_test_run(HF_DATASET_DICT["train"]))
             ]  
         if not TEST_DATASET_CACHE:
             print_rank_zero("Caching test images in memory...")
             TEST_DATASET_CACHE = [
-                self._load_row(data) for data in tqdm(HF_DATASET_DICT["test"])
+                self._load_row(data) for data in tqdm(self.check_test_run(HF_DATASET_DICT["test"]))
             ]
 
         self.split = TRAIN_DATASET_CACHE if train else TEST_DATASET_CACHE
@@ -1165,6 +1231,8 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
     def __len__(self):
         return len(self.split)
 
+    def check_test_run(self, gen):
+        yield from (gen if not self.test_run else islice(gen, 0, 50))
         
     def __getitem__(self, idx):
         if idx >= len(self):
@@ -1261,6 +1329,7 @@ class BaselineMethod():
         self.embedding_train_dataset = ChicksVisionDataset(
             train=True,
             transform=self.embedding_train_transform,
+            test_run=self.cfg.test_run,
         )
 
         self.knn_train_dataset = self.linear_train_dataset = ChicksVisionDataset(
@@ -1491,6 +1560,28 @@ class MegaDescriptorL384Baseline(BaselineMethod):
         self.model = MegaDescriptorL384()
 
 
+
+class MegaDescriptorL384FineTuneBaseline(BaselineMethod):
+    #normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    skip_embedding_training = False
+    feature_dim = 1536        
+    
+    method_specific_augmentation = T.Compose([
+        #T.Resize(size=(384, 384)),
+        T.RandAugment(num_ops=2, magnitude=20),
+        T.ToTensor(),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.model = MegaDescriptorL384FineTune(
+            batch_size_per_device=self.cfg.batch_size_per_device,
+            num_classes=self.cfg.num_classes,
+            feature_dim=self.feature_dim,
+        )
+
+
 class ViT_B_16Baseline(BaselineMethod):
     method_specific_augmentation = T.Compose([
         T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
@@ -1563,10 +1654,11 @@ class AIMBaseline(BaselineMethod):
 class Baseline:
     methods: Dict[str, Type[BaselineMethod]] = {
         #"swav": SwAVBaseline,
-        "aim": AIMBaseline,
-        "vit_b_16": ViT_B_16Baseline,
+        #"aim": AIMBaseline,
+        #"vit_b_16": ViT_B_16Baseline,
         #"resnet50": ResNet50Baseline,
-        "mega_descriptor": MegaDescriptorL384Baseline,
+        "mega_descriptor_finetune": MegaDescriptorL384FineTuneBaseline,
+        # "mega_descriptor": MegaDescriptorL384Baseline,
     }
 
     @timing_decorator
