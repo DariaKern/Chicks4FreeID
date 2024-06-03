@@ -58,8 +58,8 @@ Below are the metrics for the test set:
 | Setting                            | mAP knn                   | mAP linear                   | top1 knn                   | top1 linear                   | top5 knn                   | top5 linear                   |
 |:-----------------------------------|:--------------------------|:-----------------------------|:---------------------------|:------------------------------|:---------------------------|:------------------------------|
 | MegaDescriptor-L-384 (Frozen)      | 0.664 ± 0.040             | 0.935 ± 0.006                | 0.717 ± 0.026              | 0.879 ± 0.006                 | 0.923 ± 0.033              | 0.984 ± 0.004                 |
-| Swin-L-384                         | 0.850 ± 0.083             | 0.962 ± 0.031                | 0.890 ± 0.054              | **0.923** ± 0.059             | 0.978 ± 0.004              | **0.988** ± 0.016             |
-| ViT-B/16                           | **0.893** ± 0.013         | **0.975** ± 0.008            | **0.923** ± 0.006          | 0.928 ± 0.003                 | **0.980** ± 0.020          | 0.987 ± 0.012                 |
+| Swin-L-384                         | 0.850 ± 0.083             | 0.962 ± 0.031                | 0.890 ± 0.054              | 0.923 ± 0.059                 | 0.978 ± 0.004              | **0.988** ± 0.016             |
+| ViT-B/16                           | **0.893** ± 0.013         | **0.975** ± 0.008            | **0.923** ± 0.006          | **0.928** ± 0.003             | **0.980** ± 0.020          | 0.987 ± 0.012                 |
 
 The most interesting observation in this table is that, even though the MegaDescriptor-L-384 feature extractor has never seen our dataset, its embeddings are still relatively helpful in identifiying the chickens, even when compared to the fully supervised approaches. 
 

@@ -46,6 +46,7 @@ from torch.utils.data import DataLoader
 
 # For writing the result table to markdown
 import pandas as pd
+from PIL import Image
 
 # For fully supervised baselines
 from torchvision.models import vit_b_16, ViT_B_16_Weights
@@ -599,6 +600,11 @@ class LinearClassifier(MetricModule):
 
 
 class ViT_B_16Classifier(LinearClassifier):
+    """
+    A fully supervised model that uses the Vision Transformer model from the torchvision library
+
+    The model uses the standard ViT_B_16 model and cross entropy (as in inherited from LinearClassifier) for training
+    """
     model: VisionTransformer
     def __init__(
         self,
@@ -615,10 +621,15 @@ class ViT_B_16Classifier(LinearClassifier):
         )
 
         self.model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1)
+        # Use the Identity head to get to the features
         self.model.heads = Identity()
         
 
     def configure_optimizers(self):
+        """
+        This optimizer is a inspired the optimizer used in the lightly benchmarks for their Vision Transformer backbones
+        specifically the AIM Model.
+        """
         # Don't use weight decay for batch norm, bias parameters, and classification
         # head to improve performance.
         params, params_no_weight_decay = get_weight_decay_parameters(
@@ -654,7 +665,9 @@ class ViT_B_16Classifier(LinearClassifier):
 
 
 class ViTEmbedding(LightningModule):
-
+    """
+    This module is used to extract features from the Vision Transformer Classifier in eval mode
+    """
     def __init__(self, model: ViT_B_16Classifier) -> None:
         super().__init__()
         self.save_hyperparameters(ignore="model")
@@ -670,11 +683,11 @@ class ViTEmbedding(LightningModule):
 class MegaDescriptorL384(LightningModule):
     """
     A pretrained-model that uses the MegaDescriptor-L-384 model from the HuggingFace model hub
-    to compute baseline metrics of an unsupervised setting.
+    to compute baseline metrics using a SotA animal re-id feature extractor.
 
     The model is not finetuned and only used to extract features.
 
-    The model has been trained on external Animal Re-ID Data
+    The model has been trained on external Animal Re-ID Data and has not been trained on chickens.
     """
     def __init__(self) -> None:
         super().__init__()
@@ -697,15 +710,15 @@ class MegaDescriptorL384(LightningModule):
 
 
 
-class MegaDescriptorL384FineTune(LinearClassifier):
+class SwinL384(LinearClassifier):
     """
-    A model that uses the MegaDescriptor-L-384 model from the HuggingFace model hub
-    to compute baseline metrics of an fintetuned setting.
+    A model that uses the same architecture as the MegaDescriptor-L-384 model
+    i.e. the Swin Transformer, but is trained on the Chick4FreeID dataset
 
-    The model is  finetuned on the Chick4FreeID dataset
-
-    The model has been trained on external Animal Re-ID Data + The chicks4FreeID dataset
+    The settings and hyperparameters mirror the settings and hyperparameters of the MegaDescriptorL384 training procedure.
     """
+    # Disable logging during embedding training because the ArcFaceLoss takes an embedding isntead of class scores.
+    # Without class scores available during training, the logging would fail.
     enable_logging: bool = False
 
     def __init__(
@@ -725,6 +738,9 @@ class MegaDescriptorL384FineTune(LinearClassifier):
         
     
     def build_critierion(self):
+        """
+        For rationale why the ArcFaceLoss is used, see the paper of the MegaDescriptorL384 model
+        """
         return ArcFaceLoss(num_classes=self.num_classes, embedding_size=self.feature_dim, margin=0.5, scale=64)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -745,7 +761,7 @@ class MegaDescriptorL384FineTune(LinearClassifier):
 
         return [optimizer], [scheduler]
 
-from PIL import Image
+
 HF_DATASET_DICT: Dict[str, Dataset] = {}
 TRAIN_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
 TEST_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
@@ -755,6 +771,8 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
     """
     Provides the Chicks4FreeID HuggingFace dataset as a Torchvision dataset.
     The dataset will return a tuple (PIL.Image, target:int)
+
+    Warning, the dataset is cached in memory to speed up training (after downscaling to 384x384 pixels)
     """
 
     def __init__(
@@ -766,6 +784,15 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
         resize: int = 384,
         test_run: bool = False,
     ) -> None:
+        """
+        Args:
+            root: Passed to torchvision.datasets.VisionDataset
+            train: If True, creates dataset from training set, otherwise creates from test set.
+            transform: A function/transform that takes in an PIL image and returns a transformed version.
+            target_transform: A function/transform that takes in the target (integer) and transforms it.
+            resize: The size of the image after resizing (quadratic)
+            test_run: If True, only returns and caches the first 50 images of the dataset
+        """
         global HF_DATASET_DICT, TRAIN_DATASET_CACHE, TEST_DATASET_CACHE
         super().__init__(root, transform=transform, target_transform=target_transform)
         self.resize = resize
@@ -865,6 +892,7 @@ class BaselineMethod():
 
         # Transform for pretaining of the embedding
         self.embedding_train_transform = T.Compose([
+            # Disable resizing because it's already done in the dataset
             # self.resize_transform,
             T.RandomRotation(360),
             T.RandomHorizontalFlip(),
@@ -874,6 +902,7 @@ class BaselineMethod():
 
         # Transform for linear eval training and kkn training
         self.eval_train_transform = T.Compose([
+            # Disable resizing because it's already done in the dataset
             # self.resize_transform,
             T.RandomRotation(360),
             T.RandomHorizontalFlip(),
@@ -884,6 +913,7 @@ class BaselineMethod():
 
         # Transform for all validation datasets
         self.val_transform = T.Compose([
+            # Disable resizing because it's already done in the dataset
             # self.resize_transform,
             T.ToTensor(),
             self.normalize_transform
@@ -1104,7 +1134,7 @@ class MegaDescriptorL384Baseline(BaselineMethod):
 
 
 
-class MegaDescriptorL384FineTuneBaseline(BaselineMethod):
+class SwinL384Baseline(BaselineMethod):
     method_specific_augmentation = T.Compose([
         #T.Resize(size=(384, 384)),
         T.RandAugment(num_ops=2, magnitude=20),
@@ -1119,7 +1149,7 @@ class MegaDescriptorL384FineTuneBaseline(BaselineMethod):
 
     def __init__(self, args):
         super().__init__(args)
-        self.model = MegaDescriptorL384FineTune(
+        self.model = SwinL384(
             batch_size_per_device=self.cfg.batch_size_per_device,
             num_classes=self.cfg.num_classes,
             feature_dim=self.feature_dim,
@@ -1149,17 +1179,25 @@ class ViT_B_16Baseline(BaselineMethod):
 
 
 class Baseline:
+    """
+    The main class that runs the baseline methods.
+    """
     methods: Dict[str, Type[BaselineMethod]] = {
         #"swav": SwAVBaseline,  # Removed
         #"aim": AIMBaseline,    # Removed
         #"resnet50": ResNet50Baseline, # Removed, Resnet worked around 90% top1, it is kinda old tho tbh so it's not further pursued
         "vit_b_16": ViT_B_16Baseline,
-        "mega_descriptor_finetune": MegaDescriptorL384FineTuneBaseline,
+        "mega_descriptor_finetune": SwinL384Baseline,
         "mega_descriptor": MegaDescriptorL384Baseline,
     }
 
     @timing_decorator
     def run(self, args):
+        """
+        Run the class as specified in the config.
+            
+            args: argparse.Namespace - The CLI arguments, used as kwargs to instantiate a Config object.
+        """
         cfg = Config(**vars(args))
 
         if cfg.aggregate_metrics:
@@ -1182,12 +1220,11 @@ class Baseline:
         and return a DataFrame with the results in the ± notation.
 
         Parameters:
-        df (pd.DataFrame): Input DataFrame.
-        identifier1 (str): First identifier column name.
-        identifier2 (str): Second identifier column name.
+            df (pd.DataFrame): Input DataFrame.
+            groupby (List[str]): List of which columns to group by.
 
         Returns:
-        pd.DataFrame: DataFrame with mean and standard deviation in ± notation.
+            pd.DataFrame: DataFrame with mean and standard deviation in ± notation.
         """
         # Determine the value columns
         value_columns = [col for col in df.columns if col not in groupby]
@@ -1216,18 +1253,17 @@ class Baseline:
         #result_df = result_df.pivot(index='Setting', columns='Evaluation')
         return result_df.reset_index()
 
-    def aggregate_metrics(self, args):
-        cfg = Config(**vars(args))
+    def aggregate_metrics(self, cfg: Config):
+
+        # Agglomerate the all metric files
         metrics = list(cfg.log_dir.glob("**/metrics*.csv"))
         result_metrics = pd.concat([pd.read_csv(metric) for metric in metrics], ignore_index=True)
         result_metrics.dropna(inplace=True)
-
         result_metrics.to_csv(cfg.log_dir / "agglomerated_metrics.csv", index=False)
         result_metrics.to_markdown(cfg.log_dir / "agglomerated_metrics.md", index=False, floatfmt=".4f")
 
-        # Aggregate the metrics with error bars
+        # Aggregate the agglomerated metrics with error bars
         result_metrics = self.calculate_mean_std(result_metrics, ["Setting", "Evaluation"])
-
         result_metrics.to_csv(cfg.log_dir / "aggregated_metrics.csv", index=False)
         result_metrics.to_markdown(cfg.log_dir / "aggregated_metrics.md", index=False, floatfmt=".4f")
         print_rank_zero(f"Aggregated metrics saved in {cfg.log_dir}")
@@ -1240,11 +1276,11 @@ parser.add_argument("--epochs", type=int, default=Config.epochs)
 parser.add_argument("--num-workers", type=int, default=Config.num_workers)
 parser.add_argument("--checkpoint-path", type=Path, default=Config.checkpoint_path)
 parser.add_argument("--methods", type=str, nargs="+", default=Config.methods, choices=Baseline.methods.keys(), required=False)
-#parser.add_argument("--num-classes", type=int, default=Config.num_classes)
+#parser.add_argument("--num-classes", type=int, default=Config.num_classes) # Will be 50 for the Chicks4FreeID dataset
 parser.add_argument("--skip-embedding-training", action="store_true", default=Config.skip_embedding_training)
 parser.add_argument("--skip-knn-eval", action="store_true", default=Config.skip_knn_eval)
 parser.add_argument("--skip-linear-eval", action="store_true", default=Config.skip_linear_eval)
-#parser.add_argument("--test-run", action="store_true", default=Config.test_run)
+#parser.add_argument("--test-run", action="store_true", default=Config.test_run) # For debugging only
 parser.add_argument("--aggregate-metrics", action="store_true", default=Config.aggregate_metrics)
 
 if __name__ == "__main__":
