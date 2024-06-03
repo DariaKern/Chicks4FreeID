@@ -2,19 +2,22 @@
 # Author: Tobias
 # Description: This file contains the code for the baseline models used in the experiments
 # of the paper "Chicks4FreeID"
-# The code is based on the lightly benchmarks, but heavily modified
-# Notable changes:
-# - The code is refactored to be used in a single file
-# - The mean average precision metric is added
-# - Support for unsupervised frozen feature extractor methods like MegaDescriptorL384 is added
-# - Support for fully supervised methods like ResNet50Classifier or ViT is added
-# - All methods use the Chicks4FreeID dataset with the same train/val split and input size
-# - All evaluation augmentations are the same
-# - Added a Config class to manage hyperparameters
-# - The code is refactored to use inheritance and composition where possible
-# - The code is refactored to use the PyTorch Lightning implemenations for mAP and top-k accuracy
+# The code is inspired by the lightly benchmarks, but has significantly diverged from it over time.
+# The major reasons for this are:
+# - The code is to be used in a single file
+# - The mean average precision metric is introduced
+# - Support for unsupervised frozen feature extractor methods like MegaDescriptorL384
+# - Support for fully supervised methods like ResNet50Classifier or ViT
+# - Implementation of Chicks4FreeID dataset with caching 
+# - Single point of dataset / dataloaded / transforms handling
+# - Base classes for Metrics, Methods and Experiments
+# - All evaluation augmentations are the same now
+# - Introducing a Config class to manage hyperparameters and CLI
+# - The code is uses inheritance and composition where possible
+# - The code uses the PyTorch Lightning / torchmetrics implemenations of the metrics
 # - The end result is a markdown table to compare to the results of the paper
-# - Code that is mostly taken from lightly is marked with a comment
+# - Allows aggregtation of multiple metric tables into a single table with error bars and mean
+# - Some code is still taken from lightly, but is either imported or marked with a comment
 # Today's Date: 2024-MAY-31
 
 import argparse
@@ -36,9 +39,7 @@ from torch.nn import (
     CrossEntropyLoss,
     Identity,
     Linear,
-    Module,
-    ModuleList,
-    MSELoss
+    Module
 )
 from torch.optim import SGD, Optimizer, AdamW
 from torch.utils.data import DataLoader
@@ -47,7 +48,7 @@ from torch.utils.data import DataLoader
 import pandas as pd
 
 # For fully supervised baselines
-from torchvision.models import resnet50, vit_b_16, ViT_B_16_Weights
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 from torchvision.models.vision_transformer import VisionTransformer
 
 # For calculating the metrics
@@ -60,28 +61,16 @@ from datasets import Dataset, load_dataset
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import DeviceStatsMonitor, Callback
 from pytorch_lightning.loggers import TensorBoardLogger
-
-# For self-supervised baselines and evaluation of the models
-from lightly.data import LightlyDataset
-from lightly.loss.swav_loss import SwaVLoss
-from lightly.models.modules import (
-    SwaVProjectionHead,
-    SwaVPrototypes,
-    AIMPredictionHead,
-    MaskedCausalVisionTransformer
-)
-from lightly.transforms import SwaVTransform, AIMTransform
 from lightly.utils.dist import print_rank_zero
-from lightly.utils.lars import LARS
+
+# Some fancy stuff for optimizing vision transformers
 from lightly.utils.scheduler import CosineWarmupScheduler
-from lightly.models import utils
-from lightly.models.utils import random_prefix_mask
 from lightly.models.utils import get_weight_decay_parameters
-from lightly.models.modules.memory_bank import MemoryBankModule
 
 # For loading the state of the art re-id model MegaDescriptorL384
 import timm
 
+# For the re-training of the MegaDescriptorL384 model
 from wildlife_tools.train.objective import ArcFaceLoss
 
 @dataclass
@@ -138,7 +127,7 @@ def knn_predict(
     knn_t: float = 0.1,
 ) -> Tensor:
     """
-    [Modified version from lightly, which returns the scores. instead of the predictions]
+    [Modified version from lightly, which returns the scores instead of the predictions]
 
     Run kNN predictions on features based on a feature bank
 
@@ -209,7 +198,7 @@ def knn_predict(
 
 
 class MetricCallback(Callback):
-    """Callback that collects log metrics from the LightningModule and stores them after
+    """A [Lightly] Callback that collects log metrics from the LightningModule and stores them after
     every epoch.
 
     Attributes:
@@ -292,6 +281,7 @@ class MetricModule(LightningModule):
 class KNNClassifier(MetricModule):
     """
     A lightly KNN Classifier modified to log mean average precision metric.
+    Also it now inherits from MetricModule and the logging logic has changed.
     """
     def __init__(
         self,
@@ -453,6 +443,8 @@ class KNNClassifier(MetricModule):
 class LinearClassifier(MetricModule):
     """
     A lightly Linear Classifier, modified to log the mean average precision
+    Also, the logging logic has changed + it now inherits from MetricModule
+    Further, the LinearClassifier now also allows the instantiation of fully supervised models.
     """
 
     def __init__(
@@ -603,435 +595,6 @@ class LinearClassifier(MetricModule):
             # Set model to eval mode to disable norm layer updates.
             self.model.eval()
 
-
-class OnlineLinearClassifier(LinearClassifier):
-    """
-    A lightly Online Linear Classifier, modified to log the mean average precision
-    """
-    def __init__(
-        self,
-        feature_dim,
-        num_classes,
-        enable_logging: bool = True
-    ) -> None:
-        super().__init__(
-            model=None,  # Not used for online classifier
-            batch_size_per_device=None, # Not used for online classifier
-            feature_dim=feature_dim,
-            num_classes=num_classes,
-            enable_logging=enable_logging
-        )
-    
-    def forward(self, x: Tensor) -> Tensor:
-        #with torch.no_grad():
-        return self.classification_head(x.detach().flatten(start_dim=1))
-
-    def configure_optimizers(self) -> Tuple[List[Optimizer] | List[Dict[str, Any | str]]]:
-        # No optimization is performed in this class.
-        return None
-
-
-class AIM(MetricModule):
-    def __init__(
-        self, 
-        batch_size_per_device: int, 
-        num_classes: int, 
-        feature_dim: int
-    ) -> None:
-        super().__init__(
-            num_classes=num_classes
-        )
-        self.save_hyperparameters()
-        self.feature_dim = feature_dim
-        self.batch_size_per_device = batch_size_per_device
-
-        vit = MaskedCausalVisionTransformer(
-            img_size=384,
-            patch_size=16,
-            num_classes=num_classes,
-            embed_dim=self.feature_dim,
-            depth=12,
-            num_heads=12,
-            qk_norm=False,
-            class_token=False,
-            no_embed_class=True,
-        )
-        utils.initialize_2d_sine_cosine_positional_embedding(
-            pos_embedding=vit.pos_embed, has_class_token=vit.has_class_token
-        )
-        self.patch_size = vit.patch_embed.patch_size[0]
-        self.num_patches = vit.patch_embed.num_patches
-
-        self.backbone = vit
-        self.projection_head = AIMPredictionHead(
-            input_dim=vit.embed_dim, output_dim=3 * self.patch_size**2
-        )
-
-        self.criterion = MSELoss()
-
-        self.online_classifier = OnlineLinearClassifier(
-            feature_dim=vit.embed_dim, num_classes=num_classes
-        )
-
-    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
-        features = self.backbone.forward_features(x, mask=mask)
-        # TODO: We use mean aggregation for simplicity. The paper uses
-        # AttentionPoolingClassifier to get the class features. But this is not great
-        # as it requires training an additional head.
-        # https://github.com/apple/ml-aim/blob/1eaedecc4d584f2eb7c6921212d86a3a694442e1/aim/torch/layers.py#L337
-        return features.mean(dim=1).flatten(start_dim=1)
-
-    def training_step(
-        self, batch: Tuple[List[Tensor], Tensor, List[str]], batch_idx: int
-    ) -> Tensor:
-        views, targets = batch[0], batch[1]
-        images = views[0]  # AIM has only a single view
-        batch_size = images.shape[0]
-
-        mask = random_prefix_mask(
-            size=(batch_size, self.num_patches),
-            max_prefix_length=self.num_patches - 1,
-            device=images.device,
-        )
-        features = self.backbone.forward_features(images, mask=mask)
-        # Add positional embedding before head.
-        features = self.backbone._pos_embed(features)
-        predictions = self.projection_head(features)
-
-        # Convert images to patches and normalize them.
-        patches = utils.patchify(images, self.patch_size)
-        patches = utils.normalize_mean_var(patches, dim=-1)
-
-        loss = self.criterion(predictions, patches)
-
-        self.log(
-            "train_loss", loss, prog_bar=True, sync_dist=True, batch_size=len(targets)
-        )
-
-        # TODO: We could use AttentionPoolingClassifier instead of mean aggregation:
-        # https://github.com/apple/ml-aim/blob/1eaedecc4d584f2eb7c6921212d86a3a694442e1/aim/torch/layers.py#L337
-        cls_features = features.mean(dim=1).flatten(start_dim=1)
-        # Calculate the classification loss.
-        # with torch.no_grad():
-        cls_scores = self.online_classifier.forward(cls_features.detach())
-        cls_loss = self.online_classifier.criterion(cls_scores, targets)
-        self.log("train_cls_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
-        
-        self.update_train_metrics(cls_scores, targets)
-
-        del views, targets, images, mask, features, predictions, patches, cls_features, cls_scores, batch
-
-        return loss + cls_loss
-
-    @torch.no_grad()
-    def validation_step(
-        self, batch: Tuple[Tensor, Tensor, List[str]], batch_idx: int
-    ) -> Tensor:
-        images, targets = batch[0], batch[1]
-        features = self.backbone.forward_features(images, mask=None)
-        # Add positional embedding before head.
-        features = self.backbone._pos_embed(features)
-        cls_features = features.mean(dim=1).flatten(start_dim=1)
-        cls_scores = self.online_classifier.forward(cls_features)
-        cls_loss = self.online_classifier.criterion(cls_scores, targets)
-        
-        self.log("val_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
-        self.update_val_metrics(cls_scores, targets)
-
-        del images, targets, cls_features, cls_scores, cls_loss
-
-    def configure_optimizers(self):
-        # Don't use weight decay for batch norm, bias parameters, and classification
-        # head to improve performance.
-        params, params_no_weight_decay = utils.get_weight_decay_parameters(
-            [self.backbone, self.projection_head]
-        )
-        optimizer = AdamW(
-            [
-                {"name": "aim", "params": params},
-                {
-                    "name": "aim_no_weight_decay",
-                    "params": params_no_weight_decay,
-                    "weight_decay": 0.0,
-                },
-                {
-                    "name": "online_classifier",
-                    "params": self.online_classifier.parameters(),
-                    "weight_decay": 0.0,
-                },
-            ],
-            lr=0.001 * self.batch_size_per_device * self.trainer.world_size / 4096,
-            weight_decay=0.05,
-            betas=(0.9, 0.95),
-        )
-        scheduler = {
-            "scheduler": CosineWarmupScheduler(
-                optimizer=optimizer,
-                warmup_epochs=31250 / 125000 * self.trainer.estimated_stepping_batches,
-                max_epochs=self.trainer.estimated_stepping_batches,
-            ),
-            "interval": "step",
-        }
-        return [optimizer], [scheduler]
-
-    def configure_gradient_clipping(
-        self,
-        optimizer: Optimizer,
-        gradient_clip_val: Union[int, float, None] = None,
-        gradient_clip_algorithm: Union[str, None] = None,
-    ) -> None:
-        self.clip_gradients(
-            optimizer=optimizer, gradient_clip_val=1.0, gradient_clip_algorithm="norm"
-        )
-
-
-
-class SwAV(MetricModule):
-    """
-    A lightly SwAV model, modified to log the mean average precision
-    """
-    CROP_COUNTS: Tuple[int, int] = (2, 6)
-
-    def __init__(
-        self, 
-        batch_size_per_device: int, 
-        num_classes: int, 
-        feature_dim: int
-    ) -> None:
-        super().__init__(
-            num_classes=num_classes
-        )
-        self.save_hyperparameters()
-        self.batch_size_per_device = batch_size_per_device
-
-        resnet = resnet50()
-        resnet.fc = Identity()  # Ignore classification head
-        self.backbone = resnet
-        self.projection_head = SwaVProjectionHead()
-        self.prototypes = SwaVPrototypes(n_steps_frozen_prototypes=1)
-        self.criterion = SwaVLoss(sinkhorn_gather_distributed=True)
-        self.online_classifier = OnlineLinearClassifier(
-            feature_dim=feature_dim,
-            num_classes=num_classes,
-            enable_logging=False
-        )
-
-        # Use a queue for small batch sizes (<= 256).
-        self.start_queue_at_epoch = 15
-        self.n_batches_in_queue = 15
-        self.queues = ModuleList(
-            [
-                MemoryBankModule(
-                    size=(self.n_batches_in_queue * self.batch_size_per_device, 128)
-                )
-                for _ in range(SwAV.CROP_COUNTS[0])
-            ]
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.backbone(x)
-
-    def project(self, x: Tensor) -> Tensor:
-        x = self.projection_head(x)
-        return F.normalize(x, dim=1, p=2)
-
-    def training_step(
-        self, batch: Tuple[List[Tensor], Tensor, List[str]], batch_idx: int
-    ) -> Tensor:
-        # Normalize the prototypes so they are on the unit sphere.
-        self.prototypes.normalize()
-
-        # The dataloader returns a list of image crops where the
-        # first few items are high resolution crops and the rest are low
-        # resolution crops.
-        multi_crops, targets = batch[0], batch[1]
-
-        # Forward pass through backbone and projection head.
-        multi_crop_features = [
-            self.forward(crops).flatten(start_dim=1) for crops in multi_crops
-        ]
-        multi_crop_projections = [
-            self.project(features) for features in multi_crop_features
-        ]
-
-        # Get the queue projections and logits.
-        queue_crop_logits = None
-        with torch.no_grad():
-            if self.current_epoch >= self.start_queue_at_epoch:
-                # Start filling the queue.
-                queue_crop_projections = _update_queue(
-                    projections=multi_crop_projections[: SwAV.CROP_COUNTS[0]],
-                    queues=self.queues,
-                )
-                if batch_idx > self.n_batches_in_queue:
-                    # The queue is filled, so we can start using it.
-                    queue_crop_logits = [
-                        self.prototypes(projections, step=self.current_epoch)
-                        for projections in queue_crop_projections
-                    ]
-
-        # Get the rest of the multi-crop logits.
-        multi_crop_logits = [
-            self.prototypes(projections, step=self.current_epoch)
-            for projections in multi_crop_projections
-        ]
-
-        # Calculate the SwAV loss.
-        loss = self.criterion(
-            high_resolution_outputs=multi_crop_logits[: SwAV.CROP_COUNTS[0]],
-            low_resolution_outputs=multi_crop_logits[SwAV.CROP_COUNTS[0] :],
-            queue_outputs=queue_crop_logits,
-        )
-        self.log("train_loss",loss,prog_bar=True,sync_dist=True,batch_size=len(targets))
-
-        # Calculate the classification loss.
-        with torch.no_grad():
-            cls_scores = self.online_classifier.forward(multi_crop_features[0].detach())
-            cls_loss = self.online_classifier.criterion(cls_scores, targets)
-            self.log("train_cls_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
-        
-        self.update_train_metrics(cls_scores, targets)
-
-        del multi_crops, targets, multi_crop_features, multi_crop_projections, queue_crop_logits, multi_crop_logits
-        return loss + cls_loss
-
-    @torch.no_grad()
-    def validation_step(
-        self, batch: Tuple[Tensor, Tensor, List[str]], batch_idx: int
-    ) -> Tensor:
-        images, targets = batch[0], batch[1]
-        features = self.forward(images).flatten(start_dim=1)
-        cls_scores = self.online_classifier.forward(features)
-        cls_loss = self.online_classifier.criterion(cls_scores, targets)
-        
-        self.log("val_loss", cls_loss, prog_bar=True, sync_dist=True, batch_size=len(targets))
-        self.update_val_metrics(cls_scores, targets)
-
-        del images, targets, features, cls_scores, cls_loss
-        
-
-    def configure_optimizers(self):
-        # Don't use weight decay for batch norm, bias parameters, and classification
-        # head to improve performance.
-        params, params_no_weight_decay = get_weight_decay_parameters(
-            [self.backbone, self.projection_head, self.prototypes]
-        )
-        optimizer = LARS(
-            [
-                {"name": "swav", "params": params},
-                {
-                    "name": "swav_no_weight_decay",
-                    "params": params_no_weight_decay,
-                    "weight_decay": 0.0,
-                },
-                {
-                    "name": "online_classifier",
-                    "params": self.online_classifier.parameters(),
-                    "weight_decay": 0.0,
-                },
-            ],
-            # Smaller learning rate for smaller batches: lr=0.6 for batch_size=256
-            # scaled linearly by batch size to lr=4.8 for batch_size=2048.
-            # See Appendix A.1. and A.6. in SwAV paper https://arxiv.org/pdf/2006.09882.pdf
-            lr=0.6 * (self.batch_size_per_device * self.trainer.world_size) / 256,
-            momentum=0.9,
-            weight_decay=1e-6,
-        )
-        print_rank_zero(f"Estimated steps: {self.trainer.estimated_stepping_batches}")
-        warump_steps = int(self.trainer.estimated_stepping_batches / self.trainer.max_epochs * 10)
-        print_rank_zero(f"Warmup steps: {warump_steps}")
-        max_steps = self.trainer.estimated_stepping_batches
-        print_rank_zero(f"Max steps: {max_steps}")
-
-        scheduler = {
-            "scheduler": CosineWarmupScheduler(
-                optimizer=optimizer,
-                warmup_epochs=warump_steps,
-                max_epochs=max_steps,
-                end_value=0.0006
-                * (self.batch_size_per_device * self.trainer.world_size)
-                / 256,
-            ),
-            "interval": "step",
-        }
-        return [optimizer], [scheduler]
-
-@torch.no_grad()
-def _update_queue(
-    projections: List[Tensor],
-    queues: ModuleList,
-):
-    """
-    [Lightly function from swav]
-    
-    Adds the high resolution projections to the queues and returns the queues."""
-
-    if len(projections) != len(queues):
-        raise ValueError(
-            f"The number of queues ({len(queues)}) should be equal to the number of high "
-            f"resolution inputs ({len(projections)})."
-        )
-
-    # Get the queue projections
-    queue_projections = []
-    for i in range(len(queues)):
-        _, queue_proj = queues[i](projections[i], update=True)
-        # Queue projections are in (num_ftrs X queue_length) shape, while the high res
-        # projections are in (batch_size_per_device X num_ftrs). Swap the axes for interoperability.
-        queue_proj = torch.permute(queue_proj, (1, 0))
-        queue_projections.append(queue_proj)
-
-    return queue_projections
-
-
-
-class ResNet50Classifier(LinearClassifier):
-    """
-    A ResNet50 classifier to compute baseline metrics of a fully supervised setting.
-    """
-    def __init__(
-        self,
-        batch_size_per_device: int,
-        feature_dim,
-        num_classes,
-        freeze_model: bool = False,
-    ) -> None:
-        super().__init__(
-            model=None,
-            feature_dim=feature_dim,
-            num_classes=num_classes,
-            batch_size_per_device=batch_size_per_device,
-            freeze_model=freeze_model,
-        )
-        
-        self.model = resnet50(num_classes=num_classes,)
-        fc = self.model.fc 
-        self.model.fc = Identity()
-        self.classification_head = fc
-
-
-class ResNetEmbedding(LightningModule):
-    """
-    Converts a ResNet50Classifier into a feature extractor.
-    """
-    def __init__(
-        self,
-        model: ResNet50Classifier,
-    ) -> None:
-        super().__init__()
-        self.save_hyperparameters(ignore="model")
-        self.model = model.model
-        self.model.eval()
-
-    def forward(self, images: Tensor) -> Tensor:
-        with torch.no_grad():
-            features = self.model.forward(images).flatten(start_dim=1)
-        return features
-
-    def configure_optimizers(self) -> None:
-        # configure_optimizers must be implemented for PyTorch Lightning. Returning None
-        # means that no optimization is performed.
-        pass
 
 
 
@@ -1529,27 +1092,6 @@ class BaselineMethod():
                 
         
 
-class ResNet50Baseline(BaselineMethod):
-    method_specific_augmentation = T.Compose([
-        T.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.1),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-    feature_dim: int = 2048
-    
-    def __init__(self, args):
-        super().__init__(args)
-        self.model = ResNet50Classifier(
-            batch_size_per_device=self.cfg.batch_size_per_device,
-            num_classes=self.cfg.num_classes,
-            feature_dim=self.feature_dim,
-            freeze_model=False,
-        )
-
-
-    def get_embedding_model(self):
-        return ResNetEmbedding(model=self.model) 
-
     
 class MegaDescriptorL384Baseline(BaselineMethod):
     normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
@@ -1605,59 +1147,12 @@ class ViT_B_16Baseline(BaselineMethod):
 
 
 
-class SwAVBaseline(BaselineMethod):
-    method_specific_augmentation = SwaVTransform(
-        rr_prob=0.5,
-        rr_degrees=360,
-        gaussian_blur=0.1,
-        crop_counts=SwAV.CROP_COUNTS
-    )
-    feature_dim: int = 2048
-
-    def __init__(self, args):
-        super().__init__(
-            args
-        )
-
-        self.model = SwAV(
-            batch_size_per_device=self.cfg.batch_size_per_device,
-            num_classes=self.cfg.num_classes,
-            feature_dim=self.feature_dim,
-        )
-
-        self.embedding_train_dataset = LightlyDataset.from_torch_dataset(
-            ChicksVisionDataset(train=True),
-            transform=self.embedding_train_transform,
-        ) 
-
-
-class AIMBaseline(BaselineMethod):
-    feature_dim: int = 768    
-    method_specific_augmentation = AIMTransform(
-        input_size=384
-    )
-
-    def __init__(self, args):
-        super().__init__(args)
-        self.model = AIM(
-            batch_size_per_device=self.cfg.batch_size_per_device,
-            num_classes=self.cfg.num_classes,
-            feature_dim=self.feature_dim,
-        )
-
-        self.embedding_train_dataset = LightlyDataset.from_torch_dataset(
-            ChicksVisionDataset(train=True),
-            transform=self.embedding_train_transform,
-        )
-
-
-
 
 class Baseline:
     methods: Dict[str, Type[BaselineMethod]] = {
-        #"swav": SwAVBaseline,  # Broken
-        #"aim": AIMBaseline,    # Broken
-        #"resnet50": ResNet50Baseline, # Resnet worked around 90% top1, it is kinda old tho tbh so it's not further pursued
+        #"swav": SwAVBaseline,  # Removed
+        #"aim": AIMBaseline,    # Removed
+        #"resnet50": ResNet50Baseline, # Removed, Resnet worked around 90% top1, it is kinda old tho tbh so it's not further pursued
         "vit_b_16": ViT_B_16Baseline,
         "mega_descriptor_finetune": MegaDescriptorL384FineTuneBaseline,
         "mega_descriptor": MegaDescriptorL384Baseline,
