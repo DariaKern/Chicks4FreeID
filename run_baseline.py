@@ -104,6 +104,7 @@ class Config:
     profile= None  # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
     baseline_id: Optional[str] = None
+    aggregate_metrics: bool = True
 
 
 def clear_cache():
@@ -1562,16 +1563,17 @@ class MegaDescriptorL384Baseline(BaselineMethod):
 
 
 class MegaDescriptorL384FineTuneBaseline(BaselineMethod):
-    #normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    skip_embedding_training = False
-    feature_dim = 1536        
-    
     method_specific_augmentation = T.Compose([
         #T.Resize(size=(384, 384)),
         T.RandAugment(num_ops=2, magnitude=20),
         T.ToTensor(),
         T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
+
+    #normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    skip_embedding_training = False
+    feature_dim = 1536        
+    
 
     def __init__(self, args):
         super().__init__(args)
@@ -1653,17 +1655,22 @@ class AIMBaseline(BaselineMethod):
 
 class Baseline:
     methods: Dict[str, Type[BaselineMethod]] = {
-        #"swav": SwAVBaseline,
-        #"aim": AIMBaseline,
-        #"vit_b_16": ViT_B_16Baseline,
-        #"resnet50": ResNet50Baseline,
+        #"swav": SwAVBaseline,  # Broken
+        #"aim": AIMBaseline,    # Broken
+        #"resnet50": ResNet50Baseline, # Resnet worked around 90% top1, it is kinda old tho tbh so it's not further pursued
+        "vit_b_16": ViT_B_16Baseline,
         "mega_descriptor_finetune": MegaDescriptorL384FineTuneBaseline,
-        # "mega_descriptor": MegaDescriptorL384Baseline,
+        "mega_descriptor": MegaDescriptorL384Baseline,
     }
 
     @timing_decorator
     def run(self, args):
         cfg = Config(**vars(args))
+
+        if cfg.aggregate_metrics:
+            self.aggregate_metrics(cfg)
+            return
+        
         cfg.baseline_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         methods = cfg.methods or list(self.methods.keys())
         print_rank_zero(f"# Running: {methods}...")   
@@ -1672,7 +1679,63 @@ class Baseline:
         print_rank_zero(f"# All baselines metrics computed!")
         print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.baseline_id}") 
             
-            
+
+    
+    def calculate_mean_std(self, df: pd.DataFrame, groupby: List[str]):
+        """
+        Calculate the mean and standard deviation for all numerical columns grouped by two identifiers,
+        and return a DataFrame with the results in the ± notation.
+
+        Parameters:
+        df (pd.DataFrame): Input DataFrame.
+        identifier1 (str): First identifier column name.
+        identifier2 (str): Second identifier column name.
+
+        Returns:
+        pd.DataFrame: DataFrame with mean and standard deviation in ± notation.
+        """
+        # Determine the value columns
+        value_columns = [col for col in df.columns if col not in groupby]
+        
+        # Group by the identifiers
+        grouped = df.groupby(groupby)
+
+        # Calculate mean and standard deviation
+        mean_df = grouped.mean().reset_index()
+        std_df = grouped.std().reset_index()
+
+        # Merge the mean and standard deviation DataFrames
+        merged_df = mean_df.copy()
+        for col in value_columns:
+            merged_df[f"{col}_std"] = std_df[col]
+
+        # Function to combine mean and standard deviation with ± notation
+        def combine_mean_std(row, mean_col, std_col):
+            return f"{row[mean_col]:.2f} ± {(row[std_col] if row[std_col] is not None else 0):.2f}"
+
+        # Create a DataFrame to store results
+        result_df = mean_df.copy()
+        for col in value_columns:
+            result_df[col] = merged_df.apply(lambda row: combine_mean_std(row, col, f"{col}_std"), axis=1)
+
+        return result_df
+
+    def aggregate_metrics(self, args):
+        cfg = Config(**vars(args))
+        metrics = list(cfg.log_dir.glob("**/metrics.csv"))
+        result_metrics = pd.concat([pd.read_csv(metric) for metric in metrics], ignore_index=True)
+        result_metrics.dropna(inplace=True)
+
+        result_metrics.to_csv(cfg.log_dir / "agglomerated_metrics.csv", index=False)
+        result_metrics.to_markdown(cfg.log_dir / "agglomerated_metrics.md", index=False, floatfmt=".4f")
+
+        # Aggregate the metrics with error bars
+        result_metrics = self.calculate_mean_std(result_metrics, ["Setting", "Evaluation"])
+
+        result_metrics.to_csv(cfg.log_dir / "aggregated_metrics.csv", index=False)
+        result_metrics.to_markdown(cfg.log_dir / "aggregated_metrics.md", index=False, floatfmt=".4f")
+        print_rank_zero(f"Aggregated metrics saved in {cfg.log_dir}")
+
 
 parser = argparse.ArgumentParser(description='Baseline metrics for the paper Chicks4FreeID')
 parser.add_argument("--log-dir", type=Path, default=str(Config.log_dir))
@@ -1681,12 +1744,12 @@ parser.add_argument("--epochs", type=int, default=Config.epochs)
 parser.add_argument("--num-workers", type=int, default=Config.num_workers)
 parser.add_argument("--checkpoint-path", type=Path, default=Config.checkpoint_path)
 parser.add_argument("--methods", type=str, nargs="+", default=Config.methods, choices=Baseline.methods.keys(), required=False)
-parser.add_argument("--num-classes", type=int, default=Config.num_classes)
+#parser.add_argument("--num-classes", type=int, default=Config.num_classes)
 parser.add_argument("--skip-embedding-training", action="store_true", default=Config.skip_embedding_training)
 parser.add_argument("--skip-knn-eval", action="store_true", default=Config.skip_knn_eval)
 parser.add_argument("--skip-linear-eval", action="store_true", default=Config.skip_linear_eval)
-parser.add_argument("--test-run", action="store_true", default=Config.test_run)
-
+#parser.add_argument("--test-run", action="store_true", default=Config.test_run)
+parser.add_argument("--aggregate-metrics", action="store_true", default=Config.aggregate_metrics)
 
 if __name__ == "__main__":
     args = parser.parse_args()
