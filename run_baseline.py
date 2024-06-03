@@ -99,7 +99,7 @@ class Config:
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = False
+    test_run: bool = True
     check_val_every_n_epoch: int = 5
     profile= None  # "pytorch"
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
