@@ -1711,18 +1711,19 @@ class Baseline:
 
         # Function to combine mean and standard deviation with ± notation
         def combine_mean_std(row, mean_col, std_col):
-            return f"{row[mean_col]:.2f} ± {(row[std_col] if row[std_col] is not None else 0):.2f}"
+            return f"{row[mean_col]:.3f} ± {(row[std_col] if row[std_col] is not None else 0):.3f}"
 
         # Create a DataFrame to store results
         result_df = mean_df.copy()
         for col in value_columns:
             result_df[col] = merged_df.apply(lambda row: combine_mean_std(row, col, f"{col}_std"), axis=1)
 
-        return result_df
+        #result_df = result_df.pivot(index='Setting', columns='Evaluation')
+        return result_df.reset_index()
 
     def aggregate_metrics(self, args):
         cfg = Config(**vars(args))
-        metrics = list(cfg.log_dir.glob("**/metrics.csv"))
+        metrics = list(cfg.log_dir.glob("**/metrics*.csv"))
         result_metrics = pd.concat([pd.read_csv(metric) for metric in metrics], ignore_index=True)
         result_metrics.dropna(inplace=True)
 
