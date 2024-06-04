@@ -53,13 +53,17 @@ Metrics are from torchmetrics
 - top1: `MulticlassAccuracy(top_k=1)`
 - top5: `MulticlassAccuracy(top_k=5)`
 
-Below are the metrics for the test set:
+Below are the metrics for the test set. Standard deviatins are based on 3 runs:
 
-| Setting                            | mAP knn                   | mAP linear                   | top1 knn                   | top1 linear                   | top5 knn                   | top5 linear                   |
-|:-----------------------------------|:--------------------------|:-----------------------------|:---------------------------|:------------------------------|:---------------------------|:------------------------------|
-| MegaDescriptor-L-384 (Frozen)      | 0.664 ± 0.040             | 0.935 ± 0.006                | 0.717 ± 0.026              | 0.879 ± 0.006                 | 0.923 ± 0.033              | 0.984 ± 0.004                 |
-| Swin-L-384                         | 0.850 ± 0.083             | 0.962 ± 0.031                | 0.890 ± 0.054              | 0.923 ± 0.059                 | 0.978 ± 0.004              | **0.988** ± 0.016             |
-| ViT-B/16                           | **0.893** ± 0.013         | **0.975** ± 0.008            | **0.923** ± 0.006          | **0.928** ± 0.003             | **0.980** ± 0.020          | 0.987 ± 0.012                 |
+| Setting                            | Evaluation          | mAP           | top-1         | top-5         |
+|:-----------------------------------|:--------------------|:--------------|:--------------|:--------------|
+| MegaDescriptor-L-384               | k-NN                | 0.649 ± 0.044 | 0.709 ± 0.026 | 0.924 ± 0.027 |
+| MegaDescriptor-L-384               | Linear              | 0.935 ± 0.005 | 0.883 ± 0.009 | 0.985 ± 0.003 |
+| Swin-L-384                         | k-NN                | 0.837 ± 0.062 | 0.881 ± 0.041 | 0.983 ± 0.010 |
+| Swin-L-384                         | Linear              | 0.963 ± 0.022 | 0.922 ± 0.042 | 0.987 ± 0.012 |
+| ViT-B/16                           | k-NN                | 0.893 ± 0.010 | 0.923 ± 0.005 | 0.985 ± 0.019 |
+| ViT-B/16                           | Linear              | 0.976 ± 0.007 | 0.928 ± 0.002 | 0.990 ± 0.012 |
+
 
 The most interesting observation in this table is that, even though the MegaDescriptor-L-384 feature extractor has never seen our dataset, its embeddings are still relatively helpful in identifiying the chickens, even when compared to the fully supervised approaches. 
 
@@ -91,7 +95,7 @@ tensorboard --logdir baseline_logs
 ```
 
 > [!IMPORTANT]
-> Differnt low-level accelerator implementations (TPU, MPS, CUDA) yield different results. The original hardware config for the reported results is based on the MPS implementation accessible on a 64GB Apple M3 Max chip (2023) 💻 - it is recommened to run the baseline script with at least 64GB of VRAM / Shared RAM.
+> Differnt low-level accelerator implementations (TPU, MPS, CUDA) yield different results. The original hardware config for the reported results is based on the MPS implementation accessible on a 64GB Apple M3 Max chip (2023) 💻 - it is recommened to run the baseline script with at least 64GB of VRAM / Shared RAM. On this device, one run takes around `9:30h`
 
 
 ## ⏳ Timeline
