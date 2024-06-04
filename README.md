@@ -38,7 +38,7 @@ To establish a baseline on the dataset, we explore 3 approaches
 2. We train MegaDescriptor-L-384's underlying architecture; a Swin-Transformer, in the same way it has been used to build the MegaDescriptor-L-384, but now on our own dataset. 
    
    `timm.create_model('swin_large_patch4_window12_384')`
-3. We train a generic Vision Transformer (ViT-B/16) as a fully supervised baseline
+3. We train a Vision Transformer (ViT-B/16) as a fully supervised baseline, and focus on embeddings by replacing the classifier head with a linear layer.
    
    `from torchvision.models import vit_b_16`
 
@@ -53,12 +53,12 @@ Metrics are from torchmetrics
 - top1: `MulticlassAccuracy(top_k=1)`
 - top5: `MulticlassAccuracy(top_k=5)`
 
-Below are the metrics for the test set. Standard deviatins are based on 3 runs:
+Below are the metrics for the test set. Standard deviations are based on 3 runs:
 
 | Setting                            | Evaluation          | mAP           | top-1         | top-5         |
 |:-----------------------------------|:--------------------|:--------------|:--------------|:--------------|
-| MegaDescriptor-L-384               | k-NN                | 0.649 ± 0.044 | 0.709 ± 0.026 | 0.924 ± 0.027 |
-| MegaDescriptor-L-384               | Linear              | 0.935 ± 0.005 | 0.883 ± 0.009 | 0.985 ± 0.003 |
+| MegaDescriptor-L-384 (frozen)      | k-NN                | 0.649 ± 0.044 | 0.709 ± 0.026 | 0.924 ± 0.027 |
+| MegaDescriptor-L-384 (frozen)      | Linear              | 0.935 ± 0.005 | 0.883 ± 0.009 | 0.985 ± 0.003 |
 | Swin-L-384                         | k-NN                | 0.837 ± 0.062 | 0.881 ± 0.041 | 0.983 ± 0.010 |
 | Swin-L-384                         | Linear              | 0.963 ± 0.022 | 0.922 ± 0.042 | 0.987 ± 0.012 |
 | ViT-B/16                           | k-NN                | 0.893 ± 0.010 | 0.923 ± 0.005 | 0.985 ± 0.019 |
@@ -94,7 +94,7 @@ In a sepearte shell, open tensorboard to view progress and results
 tensorboard --logdir baseline_logs
 ```
 
-> [!IMPORTANT]
+> [!NOTE]
 > Differnt low-level accelerator implementations (TPU, MPS, CUDA) yield different results. The original hardware config for the reported results is based on the MPS implementation accessible on a 64GB Apple M3 Max chip (2023) 💻 - it is recommened to run the baseline script with at least 64GB of VRAM / Shared RAM. On this device, one run takes around `9:30h`
 
 

@@ -1,17 +1,18 @@
-datasets==2.19.1
-lightly==1.5.2
-matplotlib==3.8.4
-# scikit-learn==1.4.1.post1
-tensorboard==2.16.2
-tensorboardX==2.6.2.2
-torch-tb-profiler==0.4.3
-timm==0.9.16
-torchaudio==2.3.0
-tabulate==0.9.0
-torch==2.3.0
-pandas==2.2.2
-kaleido==0.1.*
-plotly
-psutil
-wildlife-tools==0.0.2
-pytorch-metric-learning==2.5.0
+# For loading the Chicks4FreeID dataset
+datasets==2.19.1  # Apache2.0
+# For benchmarking utils
+lightly==1.5.2  # MIT
+# For logging and calculating metrics
+matplotlib==3.8.4  # BSD Compatible
+tensorboard==2.16.2  # Apache2.0
+pandas==2.2.2  # BSD-3
+torchmetrics  # Apache2.0
+# For model building / loading / training
+timm==0.9.16  # MIT
+torch==2.3.0  # BSD-3
+# For the ArcFace loss
+wildlife-tools==0.0.2  # MIT
+# Second level dependencies (not automatically installed)
+tabulate==0.9.0  # of pandas (GPL-2.0)
+pytorch-metric-learning==2.5.0 # of wildlife-tools (MIT)
+psutil  # (BSD-3)
