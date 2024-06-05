@@ -12,42 +12,43 @@ if __name__ == "__main__":
         download_mode=DownloadMode.REUSE_CACHE_IF_EXISTS
     )
 
-    def drop_images(batch):
+    def extract_label_names(item):
         # Create a new dictionary for the transformed batch
-        new_batch = {}
+        new_item = {}
         
         # Transform instances
         new_instances = []
-        for instance in batch["instances"]:
+        for instance in item["instances"]:
             new_instance = {}
+            features = dataset.features["instances"][0]
             # Convert class label indices to names
-            new_instance["animal_category"] = dataset.features["instances"][0]["animal_category"].int2str(instance["animal_category"])
-            new_instance["identity"] = dataset.features["instances"][0]["identity"].int2str(instance["identity"])
-            new_instance["visibility"] = dataset.features["instances"][0]["visibility"].int2str(instance["visibility"])
+            new_instance["animal_category"] = features["animal_category"].int2str(instance["animal_category"])
+            new_instance["identity"] = features["identity"].int2str(instance["identity"])
+            new_instance["visibility"] = features["visibility"].int2str(instance["visibility"])
             new_instances.append(new_instance)
         
         # Add transformed instances to the new batch
-        new_batch["instances"] = new_instances
-        new_batch["coop"] = dataset.features["coop"].int2str(batch["coop"])
-        return new_batch
+        new_item["instances"] = new_instances
+        new_item["coop"] = dataset.features["coop"].int2str(item["coop"])
+        return new_item
 
-    result = [drop_images(item) for item in tqdm(dataset.to_iterable_dataset())]
+    result = [extract_label_names(item) for item in tqdm(dataset.to_iterable_dataset())]
 
-    flattened_data = []
-    index = 0
-    for entry in result:
-        for instance_id, instance in enumerate(entry['instances']):
-            flattened_data.append({
-                'Image': index,
-                'Instance': instance_id,
-                'Animal Category': instance['animal_category'],
-                'Identity': instance['identity'],
-                'Visibility': instance['visibility']
-            })
-        index += 1
+    instance_info = [
+        {
+            'Image': i,
+            'Instance': instance_id,
+            'Animal Category': instance['animal_category'],
+            'Identity': instance['identity'],
+            'Visibility': instance['visibility']
+        }
+        for i, entry in enumerate(result)
+        for instance_id, instance in enumerate(entry['instances'])
+    ]
+
 
     # Create a DataFrame
-    df = pd.DataFrame(flattened_data)
+    df = pd.DataFrame(instance_info)
 
     ducks_and_roosters = [
         "Elvis", "Jackson", "Marley", "Evelyn"
@@ -58,6 +59,8 @@ if __name__ == "__main__":
     counts_df = counts_df[counts_df.Identity != "Unknown"]
     counts_df["Identity"] = counts_df.Identity.map(lambda x: x if x not in ducks_and_roosters else f"*{x}")
     counts_df = counts_df.sort_values("best", ascending=False)
+
+    # Convert wide to long format for plotting
     counts_df = counts_df.melt(id_vars='Identity', value_vars=['good', 'best', 'bad'], var_name='Visibility', value_name='Count')
 
     fig = px.bar(
