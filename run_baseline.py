@@ -57,6 +57,8 @@ from torchmetrics.classification import MulticlassAveragePrecision, MulticlassAc
 
 # To load the Chicks4FreeID dataset
 from datasets import Dataset, load_dataset
+from sklearn.model_selection import StratifiedShuffleSplit
+from collections import defaultdict
 
 # For the training loop
 from pytorch_lightning import LightningModule, Trainer
@@ -79,22 +81,27 @@ class Config:
     batch_size_per_device: int = 16
     epochs: int = 200
     num_workers: int = 4
-    log_dir: Path = Path("baseline_logs")
     checkpoint_path: Optional[Path] = None
     num_classes: int = 50
     skip_embedding_training: bool = False
     skip_knn_eval: bool = False
     skip_linear_eval: bool = False
     methods: Optional[List[str]] = None
+    dataset_subsets: Optional[List[str]] = None
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "16-mixed"
-    test_run: bool = True
+    test_run: bool = False
     check_val_every_n_epoch: int = 5
     profile= None  # "pytorch"
+    aggregate_metrics: bool = False
+
+    # Internal Variables
     experiment_result_metrics: Optional[List[str]] = field(default_factory=lambda: [])
     baseline_id: Optional[str] = None
-    aggregate_metrics: bool = True
+    dataset_subset: str = "chicken-re-id-all-visibility"
+    log_dir: Path = Path("baseline_logs")
+
 
 
 def clear_cache():
@@ -435,10 +442,10 @@ class KNNClassifier(MetricModule):
     def on_validation_end(self) -> None:
         super().on_validation_end()
         # Clear the cache after each validation epoch to prevent memory leaks.
-        del self._train_features_tensor
-        del self._train_targets_tensor
-        del self._train_features
-        del self._train_targets
+        #del self._train_features_tensor
+        #del self._train_targets_tensor
+        #del self._train_features
+        #del self._train_targets
 
 
 class LinearClassifier(MetricModule):
@@ -710,6 +717,61 @@ class MegaDescriptorL384(LightningModule):
 
 
 
+
+class MegaDescriptorL384FineTune(LinearClassifier):
+    """
+    A model that uses the same architecture as the MegaDescriptor-L-384 model
+    i.e. the Swin Transformer, but is trained on the Chick4FreeID dataset
+
+    The settings and hyperparameters mirror the settings and hyperparameters of the MegaDescriptorL384 training procedure.
+    """
+    # Disable logging during embedding training because the ArcFaceLoss takes an embedding isntead of class scores.
+    # Without class scores available during training, the logging would fail.
+    enable_logging: bool = False
+
+    def __init__(
+        self,
+        batch_size_per_device,
+        feature_dim,
+        num_classes,
+    ) -> None:
+        super().__init__(
+            model=timm.create_model("hf-hub:BVRA/MegaDescriptor-L-384", num_classes=0, pretrained=True),
+            feature_dim=feature_dim,
+            num_classes=num_classes,
+            batch_size_per_device=batch_size_per_device,
+            freeze_model=False,
+            enable_logging=self.enable_logging
+        )
+        
+    
+    def build_critierion(self):
+        """
+        For rationale why the ArcFaceLoss is used, see the paper of the MegaDescriptorL384 model
+        """
+        return ArcFaceLoss(num_classes=self.num_classes, embedding_size=self.feature_dim, margin=0.5, scale=64)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.model(x)
+
+    def configure_optimizers(self):
+        # Combine the parameters of the model and the criterion
+        params = chain(self.model.parameters(), self.criterion.parameters())
+
+        # Define the optimizer with specified learning rate and momentum
+        optimizer = SGD(params=params, lr=0.001, momentum=0.9)
+
+        # Calculate the minimum learning rate
+        min_lr = optimizer.defaults.get("lr") * 1e-3
+
+        # Define the scheduler with a cosine annealing learning rate strategy
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=min_lr)
+
+        return [optimizer], [scheduler]
+
+
+
+
 class SwinL384(LinearClassifier):
     """
     A model that uses the same architecture as the MegaDescriptor-L-384 model
@@ -764,6 +826,7 @@ class SwinL384(LinearClassifier):
 
 HF_DATASET_DICT: Dict[str, Dataset] = {}
 TRAIN_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
+VALIDATION_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
 TEST_DATASET_CACHE: List[Tuple[Image.Image, int]] = []
 
 
@@ -771,29 +834,32 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
     """
     Provides the Chicks4FreeID HuggingFace dataset as a Torchvision dataset.
     The dataset will return a tuple (PIL.Image, target:int)
-
-    Warning, the dataset is cached in memory to speed up training (after downscaling to 384x384 pixels)
     """
 
     def __init__(
         self,
         root: Union[str, Path] = None,
         train: bool = True,
+        validation: bool = False,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         resize: int = 384,
         test_run: bool = False,
+        val_split: float = 0.1,  # Validation split ratio
+        dataset_subset = "chicken-re-id-all-visibility",
     ) -> None:
         """
         Args:
             root: Passed to torchvision.datasets.VisionDataset
             train: If True, creates dataset from training set, otherwise creates from test set.
+            validation: If True, creates dataset from validation set.
             transform: A function/transform that takes in an PIL image and returns a transformed version.
             target_transform: A function/transform that takes in the target (integer) and transforms it.
             resize: The size of the image after resizing (quadratic)
             test_run: If True, only returns and caches the first 50 images of the dataset
+            val_split: The proportion of the training data to use for validation.
         """
-        global HF_DATASET_DICT, TRAIN_DATASET_CACHE, TEST_DATASET_CACHE
+        global HF_DATASET_DICT, TRAIN_DATASET_CACHE, VALIDATION_DATASET_CACHE, TEST_DATASET_CACHE
         super().__init__(root, transform=transform, target_transform=target_transform)
         self.resize = resize
         self.transform = transform
@@ -803,27 +869,46 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
         if not HF_DATASET_DICT:
             HF_DATASET_DICT = load_dataset(
                 "dariakern/Chicks4FreeID", 
-                "chicken-re-id-best-visibility", 
+                dataset_subset, 
                 download_mode="reuse_cache_if_exists"
             )
-        if not TRAIN_DATASET_CACHE:
+        
+        if not TRAIN_DATASET_CACHE and not VALIDATION_DATASET_CACHE:
             print_rank_zero("Caching train images in memory...")
-            TRAIN_DATASET_CACHE = [
+            full_train_cache = [
                 self._load_row(data) for data in tqdm(self.check_test_run(HF_DATASET_DICT["train"]))
             ]  
+
+            # Extract the targets to perform stratified split
+            targets = [target for _, target in full_train_cache]
+
+            # Stratified split
+            stratified_split = StratifiedShuffleSplit(n_splits=1, test_size=val_split, random_state=1)
+            train_idx, val_idx = next(stratified_split.split(full_train_cache, targets))
+            
+            TRAIN_DATASET_CACHE = [full_train_cache[i] for i in train_idx]
+            VALIDATION_DATASET_CACHE = [full_train_cache[i] for i in val_idx]
+        
         if not TEST_DATASET_CACHE:
             print_rank_zero("Caching test images in memory...")
             TEST_DATASET_CACHE = [
                 self._load_row(data) for data in tqdm(self.check_test_run(HF_DATASET_DICT["test"]))
             ]
 
-        self.split = TRAIN_DATASET_CACHE if train else TEST_DATASET_CACHE
-        
+        # Assign the appropriate split
+        if train:
+            self.split = TRAIN_DATASET_CACHE
+        elif validation:
+            self.split = VALIDATION_DATASET_CACHE
+        else:
+            self.split = TEST_DATASET_CACHE
+
+
     def __len__(self):
         return len(self.split)
 
     def check_test_run(self, gen):
-        yield from (gen if not self.test_run else islice(gen, 0, 50))
+        yield from gen# (gen if not self.test_run else islice(gen, 0, 50))
         
     def __getitem__(self, idx):
         if idx >= len(self):
@@ -846,6 +931,14 @@ class ChicksVisionDataset(torchvision.datasets.VisionDataset):
 
     def __str__(self):
         return self
+    
+    def clear_cache():
+        global HF_DATASET_DICT, TRAIN_DATASET_CACHE, VALIDATION_DATASET_CACHE, TEST_DATASET_CACHE
+        HF_DATASET_DICT = {}
+        TRAIN_DATASET_CACHE = []
+        VALIDATION_DATASET_CACHE = []
+        TEST_DATASET_CACHE = []
+
 
 
 class BaselineMethod():
@@ -924,16 +1017,27 @@ class BaselineMethod():
             train=True,
             transform=self.embedding_train_transform,
             test_run=self.cfg.test_run,
+            dataset_subset=self.cfg.dataset_subset
         )
 
         self.knn_train_dataset = self.linear_train_dataset = ChicksVisionDataset(
             train=True,
             transform=self.eval_train_transform,
+            dataset_subset=self.cfg.dataset_subset
         )
    
         self.knn_val_dataset = self.linear_val_dataset  = self.embedding_val_dataset = ChicksVisionDataset(
             train=False,
+            validation=True,
             transform=self.val_transform,
+            dataset_subset=self.cfg.dataset_subset
+        )
+
+        self.knn_test_dataset = self.linear_test_dataset  = self.embedding_test_dataset = ChicksVisionDataset(
+            train=False,
+            validation=False,
+            transform=self.val_transform,
+            dataset_subset=self.cfg.dataset_subset
         )
 
     @property
@@ -1004,6 +1108,7 @@ class BaselineMethod():
             epochs = 1,
             train_dataset = self.knn_train_dataset,
             val_dataset = self.knn_val_dataset,
+            test_dataset = self.knn_test_dataset,
             log_name="knn_eval",
         )
 
@@ -1038,6 +1143,7 @@ class BaselineMethod():
             epochs = 90,
             train_dataset = self.linear_train_dataset,
             val_dataset = self.linear_val_dataset,
+            test_dataset = self.linear_test_dataset,
             log_name="linear_eval",
         )
     
@@ -1049,12 +1155,13 @@ class BaselineMethod():
             epochs = self.cfg.epochs,
             train_dataset = self.embedding_train_dataset,
             val_dataset = self.embedding_val_dataset,
+            test_dataset = self.embedding_test_dataset,
             log_name="embedding_training",
         )
 
 
     @timing_decorator
-    def train(self, classifier, epochs, train_dataset, val_dataset, log_name):
+    def train(self, classifier, epochs, train_dataset, val_dataset, test_dataset, log_name):
         train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.cfg.batch_size_per_device,
@@ -1066,6 +1173,14 @@ class BaselineMethod():
 
         val_dataloader = DataLoader(
             val_dataset,
+            batch_size=self.cfg.batch_size_per_device,
+            shuffle=False,
+            num_workers=self.cfg.num_workers,
+            persistent_workers=True,
+        )
+
+        test_dataloader = DataLoader(
+            test_dataset,
             batch_size=self.cfg.batch_size_per_device,
             shuffle=False,
             num_workers=self.cfg.num_workers,
@@ -1099,14 +1214,20 @@ class BaselineMethod():
             val_dataloaders=val_dataloader,
         )
 
+        trainer.validate(
+            model=classifier,
+            dataloaders=test_dataloader,
+            ckpt_path=None if epochs == 1 else "best",
+        )
+
         # Print the current run results
         for metric in metric_callback.val_metrics.keys():
-            max_value = max(metric_callback.val_metrics[metric])
+            max_value = (metric_callback.val_metrics[metric])[-1]
             print_rank_zero(f"{self.name} {log_name} {metric}: {max_value}")
         
         # Update the metric values in a markdown and csv file
         metrics = {
-            metric: max(value)
+            metric: (value)[-1]
             for metric, value in metric_callback.val_metrics.items()
             if "train" not in metric and "loss" not in metric
         }
@@ -1132,6 +1253,27 @@ class MegaDescriptorL384Baseline(BaselineMethod):
         super().__init__(args)
         self.model = MegaDescriptorL384()
 
+
+class MegaDescriptorL384FinetuneBaseline(BaselineMethod):
+    method_specific_augmentation = T.Compose([
+        #T.Resize(size=(384, 384)),
+        T.RandAugment(num_ops=2, magnitude=20),
+        T.ToTensor(),
+        T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ])
+
+    #normalize_transform = T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    skip_embedding_training = False
+    feature_dim = 1536        
+    
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.model = MegaDescriptorL384FineTune(
+            batch_size_per_device=self.cfg.batch_size_per_device,
+            num_classes=self.cfg.num_classes,
+            feature_dim=self.feature_dim,
+        )
 
 
 class SwinL384Baseline(BaselineMethod):
@@ -1187,9 +1329,12 @@ class Baseline:
         #"aim": AIMBaseline,    # Removed
         #"resnet50": ResNet50Baseline, # Removed, Resnet worked around 90% top1, it is kinda old tho tbh so it's not further pursued
         "vit_b_16": ViT_B_16Baseline,
-        "mega_descriptor_finetune": SwinL384Baseline,
+        "mega_descriptor_finetune": MegaDescriptorL384FinetuneBaseline,
         "mega_descriptor": MegaDescriptorL384Baseline,
+        "swin_transformer": SwinL384Baseline,
     }
+
+    all_subsets = ["chicken-re-id-all-visibility", "chicken-re-id-best-visibility"]
 
     @timing_decorator
     def run(self, args):
@@ -1201,16 +1346,27 @@ class Baseline:
         cfg = Config(**vars(args))
 
         if cfg.aggregate_metrics:
-            self.aggregate_metrics(cfg)
+            subsets = cfg.dataset_subsets or self.all_subsets
+            for subset in subsets:
+                cfg.log_dir = Path(subset)
+                self.aggregate_metrics(cfg)
             return
         
         cfg.baseline_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         methods = cfg.methods or list(self.methods.keys())
-        print_rank_zero(f"# Running: {methods}...")   
-        for method in methods:
-            self.methods[method](cfg).run_baseline_method()
+        subsets = cfg.dataset_subsets or self.all_subsets
+        
+        for subset in subsets:
+            ChicksVisionDataset.clear_cache()
+            cfg.dataset_subset = subset
+            cfg.log_dir = Path(subset)
+            print_rank_zero(f"# Running: {methods} on subset {subset}...")   
+            for method in methods:
+                self.methods[method](cfg).run_baseline_method()
+            
+            print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.baseline_id}") 
+        
         print_rank_zero(f"# All baselines metrics computed!")
-        print_rank_zero(f"# Results saved in {cfg.log_dir / cfg.baseline_id}") 
             
 
     
@@ -1270,7 +1426,7 @@ class Baseline:
 
 
 parser = argparse.ArgumentParser(description='Baseline metrics for the paper Chicks4FreeID')
-parser.add_argument("--log-dir", type=Path, default=str(Config.log_dir))
+#parser.add_argument("--log-dir", type=Path, default=str(Config.log_dir))
 parser.add_argument("--batch-size-per-device", type=int, default=Config.batch_size_per_device) #default=32) #default=128)
 parser.add_argument("--epochs", type=int, default=Config.epochs)
 parser.add_argument("--num-workers", type=int, default=Config.num_workers)
