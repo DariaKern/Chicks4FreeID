@@ -30,7 +30,7 @@ Output:
 
 ## 📊 Baseline
 
-To establish a baseline on the dataset, we explore 3 approaches
+To establish a baseline on the dataset, we explore 4 approaches
 
 1. We evaluate the SotA model in animal re-identification: MegaDescriptor-L-384, a feature extractor, pre-trained on many species and identities. 
    
