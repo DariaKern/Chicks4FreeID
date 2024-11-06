@@ -142,8 +142,8 @@ tensorboard --logdir chicken-re-id-all-visibility
 
 
 ## ⏳ Timeline
-- [2024 Nov 05] Pushed updated results for upcoming animals journal
-- [2024 Oct 26] Chicks4FreeID is no part of the wildlife datasets project [https://github.com/WildlifeDatasets/wildlife-datasets](https://github.com/WildlifeDatasets/wildlife-datasets)
+- [2024 Nov 05] Pushed updated results
+- [2024 Oct 26] Chicks4FreeID is now part of the wildlife datasets project [https://github.com/WildlifeDatasets/wildlife-datasets](https://github.com/WildlifeDatasets/wildlife-datasets)
 - [2024 May 30] DOI created: [https://doi.org/10.57967/hf/2345](https://doi.org/10.57967/hf/2345) 
 - [2024 May 23] the first version of the dataset was uploaded to Hugging Face. [https://huggingface.co/datasets/dariakern/Chicks4FreeID](https://huggingface.co/datasets/dariakern/Chicks4FreeID)
 
