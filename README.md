@@ -142,6 +142,7 @@ tensorboard --logdir chicken-re-id-all-visibility
 
 
 ## ⏳ Timeline
+- [2024 Dec 24] 🎄🎁 Paper published in Animals Special Issue Automated Monitoring of Livestock and Poultry with Machine Learning Technology, Volume II [https://doi.org/10.3390/ani15010001](https://www.mdpi.com/2076-2615/15/1/1)
 - [2024 Nov 05] Pushed updated results
 - [2024 Oct 26] Chicks4FreeID is now part of the wildlife datasets project [https://github.com/WildlifeDatasets/wildlife-datasets](https://github.com/WildlifeDatasets/wildlife-datasets)
 - [2024 May 30] DOI created: [https://doi.org/10.57967/hf/2345](https://doi.org/10.57967/hf/2345) 
@@ -153,11 +154,16 @@ coming soon ...
 
 ## 🖋️ Citation 
 ```tex
-@misc{kern2024Chicks4FreeID,
-      title={Chicks4freeID}, 
-      author={Daria Kern and Tobias Schiele and Ulrich Klauck and Winfred Ingabire},
-      year={2024},
-      doi={https://doi.org/10.57967/hf/2345},
-      note={under review}
+@Article{ani15010001,
+AUTHOR = {Kern, Daria and Schiele, Tobias and Klauck, Ulrich and Ingabire, Winfred},
+TITLE = {Towards Automated Chicken Monitoring: Dataset and Machine Learning Methods for Visual, Noninvasive Reidentification},
+JOURNAL = {Animals},
+VOLUME = {15},
+YEAR = {2025},
+NUMBER = {1},
+ARTICLE-NUMBER = {1},
+URL = {https://www.mdpi.com/2076-2615/15/1/1},
+ISSN = {2076-2615},
+DOI = {10.3390/ani15010001}
 }
 ```
