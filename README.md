@@ -142,6 +142,7 @@ tensorboard --logdir chicken-re-id-all-visibility
 
 
 ## ⏳ Timeline
+- [2025 Apr 03] Chicks4FreeID will be part of the WildlifeReID-10k dataset and the associated Kaggle challenge [https://www.kaggle.com/datasets/wildlifedatasets/wildlifereid-10k/data](https://www.kaggle.com/datasets/wildlifedatasets/wildlifereid-10k/data)
 - [2024 Dec 24] 🎄🎁 Paper published in Animals Special Issue Automated Monitoring of Livestock and Poultry with Machine Learning Technology, Volume II [https://doi.org/10.3390/ani15010001](https://www.mdpi.com/2076-2615/15/1/1)
 - [2024 Nov 05] Pushed updated results
 - [2024 Oct 26] Chicks4FreeID is now part of the wildlife datasets project [https://github.com/WildlifeDatasets/wildlife-datasets](https://github.com/WildlifeDatasets/wildlife-datasets)
