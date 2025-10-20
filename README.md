@@ -1,5 +1,5 @@
 # 🐔 Chicks4FreeID
-The very first publicly available chicken re-identification dataset
+The very first public chicken re-identification dataset
 is available on 🤗 **Hugging Face**: [huggingface.co/datasets/dariakern/Chicks4FreeID](https://huggingface.co/datasets/dariakern/Chicks4FreeID)
 
 <img src="./wiki/chickenDataset.png">
